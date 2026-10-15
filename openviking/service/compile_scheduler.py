@@ -19,8 +19,7 @@ from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from openviking.server.identity import RequestContext, Role
-from openviking.service.compile_lifecycle import task_ctx
-from openviking.service.compile_state import CompileStateStore
+from openviking.service.compile_targets import CompileStateStore, task_ctx
 from openviking_cli.exceptions import ConflictError, FailedPreconditionError, NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger

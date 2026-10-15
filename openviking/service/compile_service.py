@@ -14,7 +14,7 @@ from openviking.core.namespace import classify_uri, uri_parts
 from openviking.core.path_variables import resolve_path_variables
 from openviking.core.uri_validation import validate_request_viking_uri
 from openviking.server.identity import RequestContext
-from openviking.service.compile_lifecycle import CompileLifecycle
+from openviking.service.compile_targets import CompileLifecycle
 from openviking.service.external_task_service import (
     ExternalTaskError,
     ExternalTaskService,

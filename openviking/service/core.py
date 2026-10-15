@@ -18,10 +18,9 @@ from openviking.resource.uri_mutation_coordinator import UriMutationCoordinator
 from openviking.resource.watch_scheduler import WatchScheduler
 from openviking.server.identity import RequestContext, Role
 from openviking.service.agent_evolution_service import AgentEvolutionService
-from openviking.service.compile_lifecycle import CompileLifecycle
 from openviking.service.compile_scheduler import CompileScheduler
 from openviking.service.compile_service import CompileService
-from openviking.service.compile_state import CompileStateStore
+from openviking.service.compile_targets import CompileLifecycle, CompileStateStore
 from openviking.service.debug_service import DebugService
 from openviking.service.external_task_service import ExternalTaskService
 from openviking.service.fs_service import FSService

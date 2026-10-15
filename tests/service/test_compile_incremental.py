@@ -7,9 +7,12 @@ from types import SimpleNamespace
 import pytest
 
 from openviking.server.identity import RequestContext, Role
-from openviking.service.compile_lifecycle import CompileLifecycle, compress_scopes
 from openviking.service.compile_scheduler import TZ, CompileScheduler, current_slot, is_due
-from openviking.service.compile_state import CompileStateStore
+from openviking.service.compile_targets import (
+    CompileLifecycle,
+    CompileStateStore,
+    compress_scopes,
+)
 from openviking.service.external_task_service import ExternalTaskSnapshot
 from openviking_cli.session.user_id import UserIdentifier
 from tests.test_task_tracker import _FakeAgfs
