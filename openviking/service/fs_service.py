@@ -113,6 +113,8 @@ class FSService:
         self._resource_memory_link_service = resource_memory_link_service
         self._watch_scheduler = watch_scheduler
         self._uri_mutation_coordinator = uri_mutation_coordinator or UriMutationCoordinator()
+        # Installed by OpenVikingService; records Compile output versions after writes.
+        self.compile_versions: Optional[Any] = None
 
     def set_dependencies(
         self,
@@ -495,7 +497,11 @@ class FSService:
         context_type = context_type_for_uri(uri)
         refresh_parent_uri = self._semantic_refresh_parent_uri(uri, context_type)
         memory_overview_uri = self._memory_overview_parent_uri(uri, context_type)
+        if self.compile_versions is not None:
+            await self.compile_versions.before_remove(uri, ctx)
         result = await viking_fs.rm(uri, recursive=recursive, ctx=ctx)
+        if self.compile_versions is not None:
+            await self.compile_versions.after_remove(uri, ctx)
         await self._sync_watch_after_rm(uri, account_id=ctx.account_id, context_type=context_type)
         # A refresh on a parent that no longer exists would lock its sidecar
         # paths and thereby recreate the deleted directory. Nothing to
@@ -834,6 +840,8 @@ class FSService:
     ) -> None:
         """Commit move/watch state and enqueue all affected parent refreshes."""
         viking_fs = self._ensure_initialized()
+        if self.compile_versions is not None:
+            await self.compile_versions.before_move(from_uri, to_uri, ctx)
         watch_manager = self._get_watch_manager()
         use_watch_transaction = (
             watch_manager is not None
@@ -853,6 +861,8 @@ class FSService:
                 to_uri,
                 ctx,
             )
+        if self.compile_versions is not None:
+            await self.compile_versions.after_move(from_uri, to_uri, ctx)
         await self._refresh_move_parents(from_uri=from_uri, to_uri=to_uri, ctx=ctx)
 
     async def _finish_transfer_after_caller_cancel(
@@ -1265,15 +1275,21 @@ class FSService:
         tags: Optional[List[str]] = None,
         tag_mode: str = "replace",
         acl: AclSpec | Dict[str, Any] | None = None,
+        edit_source: Literal["manual", "agent"] = "agent",
+        record_version: bool = True,
     ) -> Dict[str, Any]:
-        """Create or update a file and refresh semantics/vectors."""
+        """Create or update a file and refresh semantics/vectors.
+
+        Writes to a Compile output file also record a file version, unless the
+        caller records its own (single-file restore).
+        """
         viking_fs = self._ensure_initialized()
         coordinator = ContentWriteCoordinator(
             viking_fs=viking_fs,
             vikingdb=self._vikingdb,
             privacy_sanitizer=self._privacy_sanitizer,
         )
-        return await coordinator.write(
+        result = await coordinator.write(
             uri=uri,
             content=content,
             ctx=ctx,
@@ -1284,6 +1300,9 @@ class FSService:
             tag_mode=tag_mode,
             acl=acl,
         )
+        if record_version and self.compile_versions is not None:
+            await self.compile_versions.record_write([result["uri"]], ctx, edit_source)
+        return result
 
     async def batch_write(
         self,
@@ -1302,7 +1321,7 @@ class FSService:
             vikingdb=self._vikingdb,
             privacy_sanitizer=self._privacy_sanitizer,
         )
-        return await coordinator.batch_write(
+        result = await coordinator.batch_write(
             root_uri=root_uri,
             operations=operations,
             ctx=ctx,
@@ -1310,6 +1329,10 @@ class FSService:
             skip_conflicts=skip_conflicts,
             processing_mode=processing_mode,
         )
+        if self.compile_versions is not None:
+            written = [*result.get("created", []), *result.get("updated", [])]
+            await self.compile_versions.record_write(written, ctx, "agent")
+        return result
 
     async def set_tags(
         self,

@@ -267,6 +267,50 @@ async def test_http_contract_preserves_legacy_list_and_retries(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_provider_start_hook_can_defer_or_finish_without_runtime(monkeypatch):
+    import openviking.service.external_task_service as module
+
+    tracker = TaskTracker(PersistentTaskStore(_FakeAgfs()))
+    monkeypatch.setattr(module, "get_task_tracker", lambda: tracker)
+    finished = []
+
+    class Provider:
+        task_type, task_id_prefix, poll_max_attempts = "compile", "cmp_", 1
+        start_result = "busy"
+        submit = AsyncMock()
+
+        def serialization_key(self, payload):
+            return payload["to"]
+
+        async def on_start(self, task):
+            return self.start_result
+
+        async def on_finish(self, task, snapshot):
+            finished.append(snapshot.status)
+            return snapshot
+
+    provider = Provider()
+    service = ExternalTaskService()
+    service.register(provider)
+    task = await tracker.create(
+        "compile",
+        account_id="acme",
+        user_id="alice",
+        task_id="cmp_hook",
+        meta={"request": {"to": "viking://resources/wiki"}},
+    )
+    assert await service.execute(task.task_id, "acme", "alice") is False
+    assert not service._owners
+    from openviking.service.external_task_service import ExternalTaskSnapshot
+
+    provider.start_result = ExternalTaskSnapshot(status="completed", result={})
+    assert await service.execute(task.task_id, "acme", "alice") is True
+    assert (await tracker.get(task.task_id, "acme", "alice")).status == TaskStatus.COMPLETED
+    assert finished == ["completed"]
+    provider.submit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_cursor_prunes_cold_expired_records_without_loading_cache():
     agfs = _FakeAgfs()
     store = PersistentTaskStore(agfs)

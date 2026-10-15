@@ -499,11 +499,18 @@ class BotCompileService:
         connection: Mapping[str, Any],
     ) -> SanitizedCompileRequest:
         args = request.args or {}
-        if args.keys() - {"last_compile_time", "wiki_links"}:
+        if args.keys() - {"last_compile_time", "wiki_links", "changes"}:
             raise CompileFailure(
                 "INVALID_ARGUMENT",
                 "VikingBot Compile does not implement provider-specific args.",
                 stage="queued",
+            )
+        changes = args.get("changes")
+        if changes is not None and not (
+            isinstance(changes, dict) and isinstance(changes.get("scopes"), list)
+        ):
+            raise CompileFailure(
+                "INVALID_ARGUMENT", "args.changes.scopes must be a list", stage="queued"
             )
         wiki_links = args.get("wiki_links", False)
         if not isinstance(wiki_links, bool):
@@ -569,7 +576,8 @@ class BotCompileService:
                 "instruction": instruction or DEFAULT_COMPILE_INSTRUCTION,
                 "instruction_provided": bool(instruction),
                 "skill": canonical_skill,
-                "last_compile_time": cutoff,
+                "last_compile_time": None if changes is not None else cutoff,
+                "changes": changes,
                 "wiki_links": wiki_links,
             }
         )
@@ -737,11 +745,14 @@ class BotCompileService:
             client = await VikingClient.create(connection=connection, config=self.config)
             source_files = None
             source_request = request
-            if request.last_compile_time is not None:
+            if request.changes is not None:
+                source_files = await self._list_changed_files(client, request.changes)
+            elif request.last_compile_time is not None:
                 source_files = await self._list_source_files(
                     client, request.from_, cutoff=request.last_compile_time
                 )
-                if not source_files:
+            if source_files is not None:
+                if not source_files and not (request.changes or {}).get("scopes"):
 
                     def complete_without_sources(task: CompileTask) -> None:
                         """Finish an incremental no-op without model calls or target writes."""
@@ -1474,6 +1485,24 @@ class BotCompileService:
             raise ValueError("Compile sources contain no files")
         return sorted(files)
 
+    async def _list_changed_files(
+        self, client: VikingClient, changes: dict[str, Any]
+    ) -> list[str]:
+        """Expand the kernel's change scopes into existing source files to read.
+
+        Deleted files are gone from the source tree; the prompt reports them so
+        the Agent can reconcile candidate outputs instead.
+        """
+        files: set[str] = set()
+        for scope in changes.get("scopes") or []:
+            if scope.get("change_type") == "deleted":
+                continue
+            if scope.get("recursive"):
+                files.update(await self._list_source_files(client, [scope["uri"]]))
+            else:
+                files.add(scope["uri"])
+        return sorted(files)
+
     async def _prepare_source_batches(
         self, client: VikingClient, roots: list[str], *, files: list[str] | None = None
     ) -> list[list[CompileSourceRange]]:
@@ -1688,6 +1717,23 @@ class BotCompileService:
             system += (
                 "\nThe from list is filtered by last_compile_time. Use only these source files "
                 "or their prepared ranges; do not scan parents or read excluded sources."
+            )
+        if request.changes is not None:
+            deleted = [
+                scope["uri"]
+                for scope in request.changes.get("scopes") or []
+                if "deleted" in {scope.get("change_type"), *(scope.get("change_types") or [])}
+            ]
+            system += (
+                "\nThis is an incremental Compile: the from list holds only changed sources. "
+                "Update existing pages in the target instead of rewriting it; you may read "
+                "other target pages when needed."
+                + (
+                    " These sources were deleted; remove or revise content derived from them: "
+                    + ", ".join(deleted)
+                    if deleted
+                    else ""
+                )
             )
         if draft_root is None and subagent_max_concurrency:
             system += (

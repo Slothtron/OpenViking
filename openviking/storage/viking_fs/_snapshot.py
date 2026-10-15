@@ -32,6 +32,9 @@ def _pkg():
     return sys.modules[__package__]
 
 
+_DERIVED_FILE_NAMES = frozenset({".abstract.md", ".overview.md", ".relations.json"})
+
+
 class _SnapshotMixin:
     """Snapshot/git-like version control (commit/restore/show/diff/log)."""
 
@@ -758,6 +761,35 @@ class _SnapshotMixin:
             limit=limit,
             paths=tree_paths,
         )
+
+    async def diff_paths(
+        self,
+        *,
+        dirs: List[str],
+        base: Optional[str],
+        head: str,
+        ctx: Optional[RequestContext] = None,
+    ) -> List[Dict[str, str]]:
+        """List files changed under ``dirs`` between two commits.
+
+        ``base=None`` treats every file as added. Requires read access only;
+        derived summaries (.abstract.md / .overview.md / .relations.json) are
+        omitted so regenerated summaries do not count as source changes.
+        """
+        real_ctx = self._ctx_or_default(ctx)
+        await self._ensure_access_many(dirs, real_ctx, action=AclAction.READ)
+        changes = await self._async_agfs.run(
+            "git_diff_paths",
+            account=real_ctx.account_id,
+            base=base,
+            head=head,
+            paths=[self._uri_to_tree_path(uri, ctx=real_ctx) for uri in dirs],
+        )
+        return [
+            {"uri": self._tree_path_to_uri(path), "change_type": change}
+            for path, change in changes
+            if path.rsplit("/", 1)[-1] not in _DERIVED_FILE_NAMES
+        ]
 
     def _collect_restore_vector_tasks(
         self,

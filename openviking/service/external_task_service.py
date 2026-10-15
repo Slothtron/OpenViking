@@ -156,7 +156,10 @@ class ExternalTaskService:
         connection: Mapping[str, Any],
         ctx: RequestContext,
         idempotency_key: str | None = None,
+        submission_payload: Mapping[str, Any] | None = None,
     ) -> TaskRecord:
+        """``submission_payload`` (default ``payload``) is what idempotent retries must match."""
+
         async def create_task():
             return await self._create(
                 task_type,
@@ -166,6 +169,7 @@ class ExternalTaskService:
                 connection=connection,
                 ctx=ctx,
                 idempotency_key=idempotency_key,
+                submission_payload=submission_payload,
             )
 
         if not idempotency_key:
@@ -188,10 +192,13 @@ class ExternalTaskService:
         connection: Mapping[str, Any],
         ctx: RequestContext,
         idempotency_key: str | None = None,
+        submission_payload: Mapping[str, Any] | None = None,
     ) -> TaskRecord:
         provider = self._provider(task_type)
         tracker = get_task_tracker()
-        request_hash = submission_request_hash(payload, private_payload)
+        request_hash = submission_request_hash(
+            payload if submission_payload is None else submission_payload, private_payload
+        )
         token = uuid4().hex
         task_id = (
             submission_task_id(ctx, task_type, provider.task_id_prefix, idempotency_key)
@@ -340,6 +347,17 @@ class ExternalTaskService:
                 self._owners.setdefault(key, set()).add(task_id)
             self._executing.add(task_id)
             claimed = True
+            on_start = getattr(provider, "on_start", None)
+            if on_start is not None:
+                started = await on_start(task)
+                if started == "busy":
+                    self._release(task)
+                    return False
+                if isinstance(started, ExternalTaskSnapshot):
+                    await self._apply_snapshot(
+                        started, task_id=task_id, account_id=account_id, user_id=user_id
+                    )
+                    return True
             await self._execute_task(task, provider, payload, account_id, user_id)
             return True
         except asyncio.CancelledError:
@@ -499,6 +517,10 @@ class ExternalTaskService:
                 f"Unknown external task status: {snapshot.status}",
                 transient=False,
             )
+        if task is not None:
+            on_finish = getattr(self._providers.get(task.task_type), "on_finish", None)
+            if on_finish is not None:
+                snapshot = await run_to_completion(lambda: on_finish(task, snapshot))
 
         async def finalize() -> None:
             if snapshot.status == "failed":

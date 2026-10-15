@@ -408,3 +408,26 @@ def test_restore_does_not_apply_current_ovgitignore(client):
         target_ref="main",
         path="resources/proj/a.log",
     )["bytes"] == b"v1"
+
+
+def test_diff_paths_reports_changes_under_directories(client):
+    account = "acct1"
+    _write(client, account, "resources/src/a.md", b"a")
+    _write(client, account, "resources/src/b.md", b"b")
+    commit = {"account": account, "branch": "main", "author_name": "a", "author_email": "a@e"}
+    base = client.git_commit(message="base", paths=["resources/src"], **commit)["commit_oid"]
+    _write(client, account, "resources/src/a.md", b"a2")
+    _write(client, account, "resources/src/sub/c.md", b"c")
+    client.rm(f"/local/{account}/resources/src/b.md")
+    client.git_commit(message="head", paths=["resources/src"], **commit)
+
+    changes = client.git_diff_paths(
+        account=account, base=base, head="main", paths=["resources/src"]
+    )
+    assert changes == [
+        ("resources/src/a.md", "modified"),
+        ("resources/src/b.md", "deleted"),
+        ("resources/src/sub/c.md", "added"),
+    ]
+    initial = client.git_diff_paths(account=account, base=None, head=base, paths=["resources/src"])
+    assert initial == [("resources/src/a.md", "added"), ("resources/src/b.md", "added")]

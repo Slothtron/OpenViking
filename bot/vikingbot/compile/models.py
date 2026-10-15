@@ -84,6 +84,8 @@ class SanitizedCompileRequest(BaseModel):
     skill: str
     # Inclusive source modification cutoff in UTC; None compiles all source files.
     last_compile_time: datetime | None = None
+    # Kernel change plan for incremental Compile; supersedes last_compile_time.
+    changes: dict[str, Any] | None = None
     # Rebuild resource index.md files from actual Markdown paths; preserve knowledge bodies.
     wiki_links: bool = Field(default=False, strict=True)
 

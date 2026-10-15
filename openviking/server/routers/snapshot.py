@@ -10,7 +10,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Body, Depends, Query
 from fastapi.responses import Response as FastAPIResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from openviking.core.uri_validation import validate_request_viking_uri
 from openviking.pyagfs.exceptions import (
@@ -112,17 +112,51 @@ async def log(
 
 
 class RestoreRequest(BaseModel):
-    """Request body for ``POST /api/v1/snapshot/restore``."""
+    """Request body for ``POST /api/v1/snapshot/restore``.
+
+    Either a directory restore (``project_dir`` / ``source_commit``) or a
+    single Compile output file restore (``path`` + ``source_version`` +
+    ``expected_version``).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     project_dir: Optional[str] = None
-    source_commit: str
+    source_commit: Optional[str] = None
+    path: Optional[str] = None
+    source_version: Optional[str] = None
+    expected_version: Optional[str] = None
     branch: str = "main"
     dry_run: bool = False
     message: Optional[str] = None
     author_name: Optional[str] = None
     author_email: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _one_mode(self) -> "RestoreRequest":
+        if self.path is not None:
+            if self.project_dir is not None or self.source_commit is not None:
+                raise ValueError("path cannot be combined with project_dir or source_commit")
+            if not self.source_version or not self.expected_version:
+                raise ValueError("path requires source_version and expected_version")
+        elif not self.source_commit:
+            raise ValueError("source_commit is required")
+        return self
+
+
+@router.get("/versions")
+async def versions(
+    uri: str = Query(..., description="Compile output file URI"),
+    limit: int = Query(20, ge=1, le=100),
+    before_version: Optional[str] = Query(None),
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """List a Compile output file's versions, newest first."""
+    uri = validate_request_viking_uri(uri, _ctx, field_name="uri")
+    result = await get_service().compile.file_versions(
+        uri, _ctx, limit=limit, before=before_version
+    )
+    return Response(status="ok", result=result)
 
 
 @router.post("/restore")
@@ -132,6 +166,12 @@ async def restore(
 ):
     """Forward-commit restore: rebuild project_dir from source_commit on top of HEAD."""
     service = get_service()
+    if request.path is not None:
+        path = validate_request_viking_uri(request.path, _ctx, field_name="path")
+        result = await service.compile.restore_file_version(
+            path, request.source_version, request.expected_version, _ctx
+        )
+        return Response(status="ok", result=result)
     project_dir = (
         validate_request_viking_uri(request.project_dir, _ctx, field_name="project_dir")
         if request.project_dir
