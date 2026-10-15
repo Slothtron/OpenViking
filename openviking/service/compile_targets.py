@@ -376,6 +376,8 @@ class CompileLifecycle:
         self.versions = CompileVersions(store, viking_fs)
         # Installed by CompileScheduler: async (account_id, record) -> None.
         self.reschedule = None
+        # Installed by CompileScheduler: async (ctx) -> (executor, credential).
+        self.save_credential = None
 
     # ---------- submission ----------
 
@@ -468,15 +470,18 @@ class CompileLifecycle:
     async def apply_schedule(
         self, record: Dict[str, Any], ctx: RequestContext, auto_update: bool, frequency: str
     ) -> None:
-        from openviking.service.compile_scheduler import encrypt_credential, now_iso
+        from openviking.service.compile_scheduler import now_iso
 
         changed = auto_update != record["auto_update"] or frequency != record["update_frequency"]
         if auto_update:
-            record["execution_context"]["executor"] = {
-                "account_id": ctx.account_id,
-                "user_id": ctx.user.user_id,
-            }
-            record["execution_context"]["credential"] = await encrypt_credential(self._fs, ctx)
+            if self.save_credential is None:
+                raise FailedPreconditionError(
+                    "Scheduled Compile is disabled on this instance",
+                    details={"reason": "COMPILE_SCHEDULER_DISABLED"},
+                )
+            executor, credential = await self.save_credential(ctx)
+            record["execution_context"]["executor"] = executor
+            record["execution_context"]["credential"] = credential
             record["last_error"] = None
         else:
             record["execution_context"]["credential"] = None

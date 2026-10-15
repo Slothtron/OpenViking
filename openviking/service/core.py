@@ -18,7 +18,7 @@ from openviking.resource.uri_mutation_coordinator import UriMutationCoordinator
 from openviking.resource.watch_scheduler import WatchScheduler
 from openviking.server.identity import RequestContext, Role
 from openviking.service.agent_evolution_service import AgentEvolutionService
-from openviking.service.compile_scheduler import CompileScheduler
+from openviking.service.compile_scheduler import CompileScheduler, build_credential_encryptor
 from openviking.service.compile_service import CompileService
 from openviking.service.compile_targets import CompileLifecycle, CompileStateStore
 from openviking.service.debug_service import DebugService
@@ -639,8 +639,14 @@ class OpenVikingService:
                 self._viking_fs,
                 backend=compile_config.scheduler_backend,
             )
+            self._compile_scheduler.credential_encryptor = build_credential_encryptor(
+                self._config.encryption
+            )
             self._compile_service.lifecycle.reschedule = self._compile_scheduler.reschedule
             self._compile_service.lifecycle.versions.reschedule = self._compile_scheduler.reschedule
+            self._compile_service.lifecycle.save_credential = (
+                self._compile_scheduler.save_credential
+            )
         self._fs_service.compile_versions = self._compile_service.lifecycle.versions
 
         if self._queue_manager:

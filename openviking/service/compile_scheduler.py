@@ -71,13 +71,7 @@ def is_due(record: Dict[str, Any], slot: datetime) -> bool:
     )
 
 
-async def encrypt_credential(viking_fs: Any, ctx: RequestContext) -> Dict[str, str]:
-    encryptor = getattr(viking_fs, "_encryptor", None)
-    if encryptor is None:
-        raise FailedPreconditionError(
-            "Scheduled Compile requires encryption.enabled=true",
-            details={"reason": "COMPILE_CREDENTIAL_ENCRYPTION_REQUIRED"},
-        )
+async def encrypt_credential(encryptor: Any, ctx: RequestContext) -> Dict[str, str]:
     if not ctx.api_key:
         raise FailedPreconditionError(
             "Scheduled Compile requires an OpenViking API key",
@@ -86,6 +80,22 @@ async def encrypt_credential(viking_fs: Any, ctx: RequestContext) -> Dict[str, s
     plaintext = json.dumps({"api_key": ctx.api_key}).encode("utf-8")
     ciphertext = await encryptor.encrypt(ctx.account_id, plaintext)
     return {"provider": CREDENTIAL_PROVIDER, "ciphertext": base64.b64encode(ciphertext).decode()}
+
+
+def build_credential_encryptor(encryption_config: Any) -> Any:
+    """FileEncryptor for scheduled-Compile API keys, independent of ``encryption.enabled``.
+
+    ``encryption.enabled`` turns on encryption of all AGFS content, which changes
+    every other feature's storage. Compile credentials only need the configured
+    root-key provider (``~/.openviking/master.key`` by default), so they always
+    use it. With ``enabled=true`` this is the same provider and root key as the
+    AGFS encryptor, so the ciphertexts are interchangeable.
+    """
+    from openviking.crypto.encryptor import FileEncryptor
+    from openviking.crypto.providers import create_root_key_provider
+
+    config = encryption_config.model_dump()
+    return FileEncryptor(create_root_key_provider(config.get("provider", "local"), config))
 
 
 class CompileScheduler:
@@ -105,12 +115,34 @@ class CompileScheduler:
         self._identity_resolver: Any = None
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        # Installed by OpenVikingService; see build_credential_encryptor.
+        self.credential_encryptor: Any = None
 
     # ---------- wiring ----------
 
     def set_identity_resolver(self, resolver: Any) -> None:
         """Install an async ``api_key -> ResolvedIdentity`` callable (APIKeyManager)."""
         self._identity_resolver = resolver
+
+    async def save_credential(self, ctx: RequestContext) -> tuple[Dict[str, Any], Dict[str, str]]:
+        """Return ``(executor, credential)`` to store when enabling scheduled updates.
+
+        The executor is the request's effective user. ``key_type`` is ``root`` when
+        the key is the server root key: only a trusted-mode request can use it for
+        data access (it asserted the user via ``X-OpenViking-Account/User``); an
+        ``api_key``-mode request never reaches here with a root key, since data
+        routes reject it with 403.
+        """
+        key_type = "user"
+        if self._identity_resolver is not None and ctx.api_key:
+            try:
+                identity = await self._identity_resolver(ctx.api_key)
+            except Exception:
+                identity = None
+            if identity is not None and identity.role == Role.ROOT and identity.account_id is None:
+                key_type = "root"
+        executor = {"account_id": ctx.account_id, "user_id": ctx.user.user_id, "key_type": key_type}
+        return executor, await encrypt_credential(self.credential_encryptor, ctx)
 
     def install_expiry(self, scheduler: Any) -> None:
         """Register the redis backend handler; call before ExpiryRuntime.start_roles()."""
@@ -230,19 +262,24 @@ class CompileScheduler:
         return outcome
 
     async def _executor(self, record: Dict[str, Any]) -> tuple[RequestContext, Dict[str, Any]]:
-        """Decrypt the saved key and verify it still resolves to the saved executor."""
+        """Decrypt the saved key and verify it still authorizes the saved executor.
+
+        A user key must still resolve to the saved account and user. A root key
+        (trusted mode) resolves to no user; it stays valid while it is the root
+        key, and the run acts as the saved executor, as trusted requests do with
+        ``X-OpenViking-Account`` / ``X-OpenViking-User``.
+        """
         context = record["execution_context"]
         executor, credential = context.get("executor"), context.get("credential")
         invalid = FailedPreconditionError(
             "Scheduled Compile API key is invalid; save the update settings with a valid key",
             details={"reason": "COMPILE_CREDENTIAL_INVALID"},
         )
-        encryptor = getattr(self._fs, "_encryptor", None)
-        if not executor or not credential or encryptor is None:
+        if not executor or not credential or self.credential_encryptor is None:
             raise invalid
         try:
             ciphertext = base64.b64decode(credential["ciphertext"], validate=True)
-            plaintext = await encryptor.decrypt(executor["account_id"], ciphertext)
+            plaintext = await self.credential_encryptor.decrypt(executor["account_id"], ciphertext)
             api_key = json.loads(plaintext.decode("utf-8"))["api_key"]
         except Exception as exc:
             raise invalid from exc
@@ -251,9 +288,11 @@ class CompileScheduler:
                 identity = await self._identity_resolver(api_key)
             except Exception as exc:
                 raise invalid from exc
-            if (identity.account_id, identity.user_id) != (
-                executor["account_id"],
-                executor["user_id"],
+            root_key = identity.role == Role.ROOT and identity.account_id is None
+            if root_key != (executor.get("key_type") == "root") or (
+                not root_key
+                and (identity.account_id, identity.user_id)
+                != (executor["account_id"], executor["user_id"])
             ):
                 raise invalid
         ctx = RequestContext(

@@ -496,6 +496,21 @@ async def test_user_key_cannot_access_admin_api(auth_client: httpx.AsyncClient, 
     assert resp.status_code == 403
 
 
+async def test_root_key_cannot_enable_compile_schedule(auth_client: httpx.AsyncClient):
+    """In api_key mode the ROOT key is management-only, so it cannot save a Compile schedule."""
+    resp = await auth_client.post(
+        "/api/v1/compile",
+        headers={"X-API-Key": ROOT_KEY},
+        json={
+            "from": ["viking://resources/src"],
+            "to": "viking://resources/wiki",
+            "skill": "viking://agent/skills/wiki",
+            "args": {"auto_update": True, "update_frequency": "daily"},
+        },
+    )
+    assert resp.status_code == 403
+
+
 @pytest.mark.parametrize("role", [Role.ADMIN, Role.USER])
 async def test_api_key_identity_cannot_be_overridden(auth_app, role):
     manager = auth_app.state.api_key_manager

@@ -175,13 +175,24 @@ class _Encryptor:
         return ciphertext[len(b"enc:") :]
 
 
-@pytest.mark.asyncio
-async def test_scheduler_submits_once_per_slot_and_disables_invalid_keys():
+async def _scheduled_target(identities, ctx=CTX):
+    """Register a daily target through a scheduler whose keys resolve via ``identities``."""
     store, fs = CompileStateStore(_Agfs()), _GitFs()
-    fs._encryptor = _Encryptor()
-
     fs.files = {f"{TO}/page.md": "page"}
     lifecycle = CompileLifecycle(store, fs)
+    submitted = []
+
+    async def create_scheduled(record, *, ctx, connection, idempotency_key):
+        submitted.append((idempotency_key, connection, record["execution_context"]))
+
+    scheduler = CompileScheduler(SimpleNamespace(create_scheduled=create_scheduled), store, fs)
+    scheduler.credential_encryptor = _Encryptor()
+
+    async def resolve(api_key):
+        return identities[api_key]
+
+    scheduler.set_identity_resolver(resolve)
+    lifecycle.save_credential = scheduler.save_credential
     payload = await lifecycle.prepare(
         {
             "from": [SRC],
@@ -189,29 +200,28 @@ async def test_scheduler_submits_once_per_slot_and_disables_invalid_keys():
             "skill": SKILL,
             "args": {"auto_update": True, "update_frequency": "daily", "model_name": "m"},
         },
-        CTX,
+        ctx,
         instruction_set=False,
     )
     target_id = payload["compile"]["target_id"]
     async with store.edit("acme", target_id) as record:
         record["initialized"] = True
         record["auto_update_enabled_at"] = "2026-10-10T00:00:00+08:00"
-    submitted = []
+    return store, scheduler, target_id, submitted
 
-    async def create_scheduled(record, *, ctx, connection, idempotency_key):
-        submitted.append((idempotency_key, connection["api_key"], record["execution_context"]))
 
-    scheduler = CompileScheduler(SimpleNamespace(create_scheduled=create_scheduled), store, fs)
-
-    async def resolve(api_key):
-        return SimpleNamespace(account_id="acme", user_id="alice" if api_key == "key-1" else "x")
-
-    scheduler.set_identity_resolver(resolve)
+@pytest.mark.asyncio
+async def test_scheduler_submits_once_per_slot_and_disables_invalid_keys():
+    alice = SimpleNamespace(role=Role.USER, account_id="acme", user_id="alice")
+    other = SimpleNamespace(role=Role.USER, account_id="acme", user_id="x")
+    store, scheduler, target_id, submitted = await _scheduled_target(
+        {"key-1": alice, "key-2": other}
+    )
     now = datetime(2026, 10, 13, 1, 0, tzinfo=TZ)
     assert await scheduler.trigger_if_due("acme", target_id, now) == "submitted"
     assert await scheduler.trigger_if_due("acme", target_id, now) == "not_due"
     assert submitted[0][0] == f"compile-schedule:{target_id}:2026-10-13T00:00:00+08:00"
-    assert submitted[0][1] == "key-1"
+    assert submitted[0][1]["api_key"] == "key-1"
     assert submitted[0][2]["args"] == {"model_name": "m"}
     stored = json.dumps(await store.get("acme", target_id))
     assert "key-1" not in stored
@@ -224,3 +234,17 @@ async def test_scheduler_submits_once_per_slot_and_disables_invalid_keys():
     record = await store.get("acme", target_id)
     assert record["auto_update"] is False and record["last_error"]
     assert len(submitted) == 1
+
+
+@pytest.mark.asyncio
+async def test_trusted_root_key_runs_as_the_asserted_user():
+    root = SimpleNamespace(role=Role.ROOT, account_id=None, user_id=None)
+    trusted = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER, api_key="root")
+    store, scheduler, target_id, submitted = await _scheduled_target({"root": root}, trusted)
+    executor = (await store.get("acme", target_id))["execution_context"]["executor"]
+    assert executor == {"account_id": "acme", "user_id": "alice", "key_type": "root"}
+
+    now = datetime(2026, 10, 13, 1, 0, tzinfo=TZ)
+    assert await scheduler.trigger_if_due("acme", target_id, now) == "submitted"
+    connection = submitted[0][1]
+    assert (connection["account_id"], connection["user_id"]) == ("acme", "alice")
