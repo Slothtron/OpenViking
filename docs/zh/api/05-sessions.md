@@ -44,7 +44,17 @@ Session API 按认证用户作用域访问会话，并返回 canonical user sess
 |------|------|------|--------|------|
 | session_id | str | 否 | None | 会话 ID。如果为 None，则创建一个自动生成 ID 的新会话 |
 | memory_policy | object | 否 | None | 会话默认的记忆抽取策略。可选的 `self` 和 `peer` 开关控制写入目标；`working_memory.enabled` 默认 `false`，不生成归档摘要和 checkpoint 摘要，显式设为 `true` 才会生成；可选的顶层 `memory_types` 将抽取限制为指定的 enabled memory schema。包含 `experiences` 时会自动激活 `cases` 和 `trajectories`；不包含 `experiences` 时，显式传入的 `cases` 和 `trajectories` 会被忽略。所有 `enabled` 值都应使用 JSON 布尔值。旧版 boolean-like 值暂时仍兼容（字符串 `"false"` 会正确解析为 false），但会产生弃用警告。`memory_types` 未传或为 `null` 时允许所有 enabled memory schema。非法结构或未知 memory type 会以 `InvalidArgumentError` 拒绝。 |
+| privacy_policy | object | 否 | None | 会话的隐私策略，仅在创建时设置（字段见下表）。生效值在响应的 `result.privacy_policy` 中返回。详见[隐私配置](../concepts/13-privacy.md)。 |
 | auto_commit_policy | object | 否 | None | 可选的自动 commit 策略（见下表）。传入的字段会被校验并 clamp 到取值范围，然后合并到默认值之上；最终生效的策略会在响应的 `result.auto_commit_policy` 中返回，并持久化到 session meta。省略时，新 Session 先继承 `server.user_config_defaults.auto_commit_policy`，再沿用现有 `memory.session_auto_commit.enabled` 行为。之后可通过 `update_session_config()` 部分更新或禁用该策略。 |
+
+`privacy_policy` 字段（仅在创建时设置，两个开关均为可选）：
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `extract.enabled` | boolean | `true` | 消息落盘前按规则提取，原值单独保存，消息中保存占位符。 |
+| `restore.enabled` | boolean | `false` | 通过[内容 API](12-content.md) 读取该 Session 的消息文件、历史消息和外置工具输出文件时还原占位符，不修改存储内容。 |
+
+未填写的字段使用默认值。两个开关相互独立，必须使用 JSON 布尔值；非法结构或未知字段以 `InvalidArgumentError`（HTTP `400`）拒绝。不能通过 `update_session_config()` 修改该策略。没有策略的旧 Session 在后续写入时使用默认值，历史消息不重新扫描。
 
 `auto_commit_policy` 字段（均为可选；存在 policy 时，未传字段回退到默认值）：
 
@@ -77,6 +87,12 @@ curl -X POST http://localhost:1933/api/v1/sessions \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key" \
   -d '{"session_id": "my-custom-session-id"}'
+
+# 创建能够自动读取还原敏感信息的会话
+curl -X POST http://localhost:1933/api/v1/sessions \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{"privacy_policy":{"extract":{"enabled":true},"restore":{"enabled":true}}}'
 
 # 创建带自定义自动 commit 策略的新会话
 curl -X POST http://localhost:1933/api/v1/sessions \
@@ -123,6 +139,12 @@ result = client.create_session(
     },
 )
 print(result["auto_commit_policy"])
+
+# 创建读取时自动还原凭据的新会话
+result = client.create_session(
+    options={"privacy_policy": {"restore": {"enabled": True}}},
+)
+print(result["privacy_policy"])
 ```
 
 **TypeScript SDK**
@@ -161,6 +183,10 @@ ov session new
     "user": {
       "account_id": "default",
       "user_id": "alice"
+    },
+    "privacy_policy": {
+      "extract": {"enabled": true},
+      "restore": {"enabled": false}
     },
     "auto_commit_policy": null
   }
@@ -409,6 +435,7 @@ ov session get a1b2c3d4
 部分更新已有 session 的可变配置。修改会在后续消息写入、idle 扫描和 commit
 中生效。只有 `/api/v1/sessions/{session_id}/config` 子路径接受 `PATCH`；基础
 `/api/v1/sessions/{session_id}` 端点不支持该方法。
+`privacy_policy` 仅在创建时设置，因此，此 API 不接受该字段。
 
 **代码入口**：
 - `openviking/server/routers/sessions.py:update_session_config()` - HTTP 路由
@@ -587,7 +614,7 @@ curl --get http://localhost:1933/api/v1/sessions/session-id/tool-results \
 
 ### read_tool_result()
 
-按 Unicode 字符范围读取一个外置工具结果。
+按 Unicode 字符范围读取一个外置工具结果。 此 API 返回的内容中可能含有敏感信息的占位符，若需还原，使用[内容 API](12-content.md) 读取对应文件。
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
@@ -927,7 +954,7 @@ ov session get-session-archive a1b2c3d4 archive_002
 
 #### 1. API 实现介绍
 
-删除该会话目录，包括消息、归档历史和会话内的审计记录。已经抽取到用户或 Peer 记忆目录的长期记忆不会随之删除；需要删除这些记忆时，单独定位并删除对应 URI。此接口不提供自动撤销。
+删除该会话目录，包括消息、归档历史和会话内的审计记录。已经抽取到用户或 Peer 记忆目录的长期记忆不会随之删除；需要删除这些记忆时，单独定位并删除对应 URI。此接口不提供自动撤销。已经保存的 Privacy 配置（`category=session`、`target_key=session_id`）也不会随之删除。
 
 **代码入口**：
 - `openviking/server/routers/sessions.py:delete_session()` - HTTP 路由

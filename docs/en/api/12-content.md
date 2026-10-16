@@ -144,14 +144,14 @@ Read the complete text of an L0, L1, or L2 file.
 | uri | str | Yes | - | Viking URI (e.g. `viking://resources/docs/api.md`) or a 32-character hex vector record `id` (returned by `stat()`) |
 | offset | int | No | 0 | Starting line number (0-indexed) |
 | limit | int | No | -1 | Number of lines to read, `-1` means read to end |
-| raw | bool | No | false | Return raw stored content without memory-field cleanup. In Python, use `client.read_raw(uri)` to read this form. |
+| raw | bool | No | false | Return stored content without memory-field cleanup. In Python, use `client.read_raw(uri)` to read this form. |
 
 **Notes**
 
 - `read()` accepts file URIs only. Passing an existing directory URI returns `INVALID_ARGUMENT` (`400`), not `NOT_FOUND`. This error carries a structured `details` payload — `details.expected` is `"file"`, `details.actual` is `"directory"`, and `details.resource` is the offending URI (present on the HTTP path) — so clients can detect a file-vs-directory mismatch programmatically (for example, fall back to `list`) instead of string-matching the message.
 - Instead of a Viking URI, you may pass the 32-character hex `id` returned by `stat()` for a file. The server looks up the URI via the vector index and applies the same permission checks. Because indexing is asynchronous, a newly returned ID might not be resolvable immediately; lookup also fails if the corresponding vector record has been deleted. In both cases, the server returns `NOT_FOUND` and indicates that the data may not have been indexed yet or may have been deleted.
 - Public URI parameters accept `resources`, `user`, and `agent` scopes. For session files, use `viking://user/{user_id}/sessions/{session_id}/messages.jsonl` or the backward-compatible `viking://session/{session_id}/messages.jsonl` alias. Internal scopes such as `temp` and `queue` return `INVALID_URI`.
-
+- Sensitive value restore follows the content type: `SKILL.md` uses the active Skill config; Session message files, archived messages, and externalized `tool-results/{id}/output.txt` use the active Session config only when `privacy_policy.restore.enabled=true`. Missing Session values leave their placeholders unchanged. Restore affects the response only, not stored files; see [Privacy Configs](../concepts/13-privacy.md).
 
 **Python SDK**
 

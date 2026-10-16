@@ -1,8 +1,6 @@
 # 隐私配置
 
-隐私配置用于按 `category + target_key` 管理敏感字段版本（如 skill 的 `api_key`、`base_url`）。
-
-配置值变化时会生成版本快照，可查询历史版本并切换生效版本。提交与当前版本相同的值不会创建新版本。
+隐私配置在当前用户空间内，按 `category + target_key` 管理技能、会话中的敏感信息（如密钥、凭据等）。配置值变化时会生成版本快照，可查询历史版本并切换生效版本。提交与当前版本相同的值不会创建新版本。
 
 以下示例使用当前用户的 API Key。trusted 模式需补充部署要求的身份头。读取接口和 CLI 会返回保存的实际值；下文的 `***` 仅为示例占位符，不表示接口自动脱敏。
 
@@ -10,10 +8,10 @@
 
 ## 典型场景
 
-- 为某个 skill 保存密钥等敏感配置
+- 为某个 skill 或 session 保存密钥等敏感配置
 - 轮换密钥（新版本）
 - 回滚到历史版本
-- 在读取 skill 内容时按占位符自动恢复配置值
+- 在读取 skill 或 session 内容时按占位符恢复配置值
 
 ---
 
@@ -92,9 +90,11 @@ curl -X GET http://localhost:1933/api/v1/privacy-configs \
 ```json
 {
   "status": "ok",
-  "result": ["skill"]
+  "result": ["session", "skill"]
 }
 ```
+
+只返回已有配置的分类；Session 未提取到原值时，不会创建对应的 Privacy 配置。
 
 ---
 
@@ -344,6 +344,7 @@ curl -X POST "http://localhost:1933/api/v1/privacy-configs/skill/byted-viking-se
 # 分类/目标
 ov privacy categories
 ov privacy list skill
+ov privacy list session
 
 # 当前生效配置（支持快捷形式）
 ov privacy get skill byted-viking-search-knowledgebase
@@ -371,5 +372,7 @@ ov privacy activate skill byted-viking-search-knowledgebase 2
 ## 相关文档
 
 - [技能](04-skills.md) - 技能写入与读取
+- [会话](05-sessions.md) - 会话创建与隐私配置
+- [隐私配置](../concepts/13-privacy.md) - 隐私敏感值的提取与还原机制
 - [文件系统](03-filesystem.md) - `read`/`write`/`ls` 等
 - [系统](07-system.md) - 服务状态与可观测性

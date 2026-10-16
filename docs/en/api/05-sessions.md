@@ -44,7 +44,17 @@ Create a new session. Sessions are containers for conversations, storing message
 |-----------|------|----------|---------|-------------|
 | session_id | str | No | None | Session ID. Creates new session with auto-generated ID if None |
 | memory_policy | object | No | None | Default memory extraction policy for the session. Optional `self` and `peer` switches control write targets, `working_memory.enabled` defaults to `false` (no archive/checkpoint summaries); explicitly set it to `true` to generate summaries, and optional top-level `memory_types` limits extraction to specific enabled memory schemas. Including `experiences` automatically activates `cases` and `trajectories`; without `experiences`, explicitly supplied `cases` and `trajectories` are ignored. Use JSON booleans for every `enabled` value. Legacy boolean-like values remain accepted temporarily (including string `"false"`, which is parsed as false) but emit a deprecation warning. When `memory_types` is omitted or `null`, all enabled memory schemas are allowed. Invalid shapes or unknown memory types are rejected with `InvalidArgumentError`. |
+| privacy_policy | object | No | None | Session privacy policy, set only at creation (see fields below). The effective policy is returned in `result.privacy_policy`. See [Privacy Configs](../concepts/13-privacy.md). |
 | auto_commit_policy | object | No | None | Optional auto-commit policy (see table below). Any provided fields are validated, clamped to their bounds, and merged over the defaults; the effective policy is returned in the response `result.auto_commit_policy` and persisted into session metadata. If omitted, the new Session inherits `server.user_config_defaults.auto_commit_policy`, then the existing `memory.session_auto_commit.enabled` behavior. The policy can later be partially updated or disabled through `update_session_config()`. |
+
+`privacy_policy` fields (set only at creation; both switches are optional):
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `extract.enabled` | boolean | `true` | Rule-based extraction before message persistence. Captured values are saved separately and messages contain placeholders. |
+| `restore.enabled` | boolean | `false` | Restore placeholders when reading this Session's message files, archived messages, and externalized tool output files through the [Content API](12-content.md). Stored files are unchanged. |
+
+Missing fields use the defaults. The switches are independent and require JSON booleans. Invalid structures or unknown fields are rejected with `InvalidArgumentError` (HTTP `400`). The policy cannot be updated through `update_session_config()`. Existing Sessions without a policy use the defaults for future writes; historical messages are not rescanned.
 
 `auto_commit_policy` fields (all optional; omitted fields fall back to the defaults when a policy is present):
 
@@ -77,6 +87,12 @@ curl -X POST http://localhost:1933/api/v1/sessions \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key" \
   -d '{"session_id": "my-custom-session-id"}'
+
+# Create a session that automatically restores sensitive values on read
+curl -X POST http://localhost:1933/api/v1/sessions \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{"privacy_policy":{"extract":{"enabled":true},"restore":{"enabled":true}}}'
 
 # Create new session with a custom auto-commit policy
 curl -X POST http://localhost:1933/api/v1/sessions \
@@ -123,6 +139,12 @@ result = client.create_session(
     },
 )
 print(result["auto_commit_policy"])
+
+# Create a session that restores credentials on read
+result = client.create_session(
+    options={"privacy_policy": {"restore": {"enabled": True}}},
+)
+print(result["privacy_policy"])
 ```
 
 **TypeScript SDK**
@@ -161,6 +183,10 @@ ov session new
     "user": {
       "account_id": "default",
       "user_id": "alice"
+    },
+    "privacy_policy": {
+      "extract": {"enabled": true},
+      "restore": {"enabled": false}
     },
     "auto_commit_policy": null
   }
@@ -410,6 +436,7 @@ Partially update the mutable configuration of an existing session. Changes take
 effect on subsequent message writes, idle scans, and commits. Only the
 `/api/v1/sessions/{session_id}/config` subpath accepts `PATCH`; the base
 `/api/v1/sessions/{session_id}` endpoint does not.
+`privacy_policy` can only be set at creation, so this API does not accept it.
 
 **Code Entry Points**:
 - `openviking/server/routers/sessions.py:update_session_config()` - HTTP route
@@ -589,7 +616,7 @@ curl --get http://localhost:1933/api/v1/sessions/session-id/tool-results \
 
 ### read_tool_result()
 
-Read one externalized tool result by Unicode character range.
+Read one externalized tool result by Unicode character range. The returned content may contain placeholders for sensitive values. To restore them, read the corresponding file through the [Content API](12-content.md).
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -927,7 +954,7 @@ If the archive does not exist, is incomplete, or does not belong to the session,
 
 #### 1. API Implementation Introduction
 
-Delete the session directory, including messages, archives, and session audit records. Long-term memories already extracted into user or Peer memory directories remain; locate and delete those URIs separately when needed. This endpoint has no automatic undo.
+Delete the session directory, including messages, archives, and session audit records. Long-term memories already extracted into user or Peer memory directories remain; locate and delete those URIs separately when needed. This endpoint has no automatic undo. The privacy config (`category=session`, `target_key=session_id`) is retained.
 
 **Code Entries:**
 - `openviking/server/routers/sessions.py:delete_session()` - HTTP route
