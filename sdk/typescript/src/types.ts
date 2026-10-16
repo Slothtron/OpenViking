@@ -282,6 +282,7 @@ export interface Message {
 export interface CreateSessionOptions {
   sessionId?: string;
   memoryPolicy?: JsonObject;
+  privacyPolicy?: JsonObject;
   autoCommitPolicy?: JsonObject | null;
   memoryExtractionConfig?: MemoryExtractionConfig;
   telemetry?: unknown;

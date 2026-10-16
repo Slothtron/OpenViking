@@ -381,6 +381,7 @@ type GlobOptions struct {
 type CreateSessionOptions struct {
 	SessionID              string
 	MemoryPolicy           map[string]any
+	PrivacyPolicy          map[string]any
 	AutoCommitPolicy       map[string]any
 	DisableAutoCommit      bool
 	MemoryExtractionConfig map[string]any
