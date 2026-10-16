@@ -24,6 +24,7 @@ from openviking.privacy import (
     get_skill_name_from_uri,
     restore_skill_content,
 )
+from openviking.privacy.session_restore import restore_session_read
 from openviking.resource.uri_mutation_coordinator import UriMutationCoordinator
 from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
@@ -1061,15 +1062,20 @@ class FSService:
             legacy_uri = validate_safe_viking_uri_path(resolved_uri.replace("%20", " "))
             content = await viking_fs.read_file(legacy_uri, ctx=ctx)
             resolved_uri = legacy_uri
-        skill_name = get_skill_name_from_uri(resolved_uri)
-        if skill_name and self._privacy_config_service:
-            current = await self._privacy_config_service.get_current(
-                ctx=ctx,
-                category="skill",
-                target_key=skill_name,
-            )
-            if current:
-                content = restore_skill_content(content, skill_name, current.values)
+        if self._privacy_config_service:
+            skill_name = get_skill_name_from_uri(resolved_uri)
+            if skill_name:
+                current = await self._privacy_config_service.get_current(
+                    ctx=ctx,
+                    category="skill",
+                    target_key=skill_name,
+                )
+                if current:
+                    content = restore_skill_content(content, skill_name, current.values)
+            else:
+                content = await restore_session_read(
+                    viking_fs, self._privacy_config_service, resolved_uri, content, ctx
+                )
 
         if offset == 0 and limit == -1:
             return content
