@@ -222,6 +222,31 @@ class UserPrivacyConfigService:
         *,
         owner_lease_ref: Optional[dict[str, Any]] = None,
     ) -> UserPrivacyConfigVersion:
+        return await self._upsert(
+            ctx,
+            category,
+            target_key,
+            values,
+            updated_by=updated_by,
+            change_reason=change_reason,
+            labels=labels,
+            owner_lease_ref=owner_lease_ref,
+        )
+
+    async def _upsert(
+        self,
+        ctx: RequestContext,
+        category: str,
+        target_key: str,
+        values: dict[str, Any],
+        updated_by: str = "",
+        change_reason: str = "",
+        labels: Optional[dict[str, Any]] = None,
+        *,
+        merge: bool = False,
+        owner_lease_ref: Optional[dict[str, Any]] = None,
+    ) -> UserPrivacyConfigVersion:
+        """Replace or merge values under one lock using one current-snapshot read."""
         async with self._config_lock(
             ctx, category, target_key, owner_lease_ref=owner_lease_ref
         ) as lease:
@@ -229,6 +254,10 @@ class UserPrivacyConfigService:
             now = get_current_timestamp()
             meta = await self.get_meta(ctx, category, target_key)
             current = await self.get_current(ctx, category, target_key)
+            if merge:
+                merged = dict(current.values) if current else {}
+                merged.update(values)
+                values = merged
 
             if current and canonicalize_values(current.values) == canonicalize_values(values):
                 if meta is None:
@@ -284,6 +313,30 @@ class UserPrivacyConfigService:
                 meta.labels = dict(labels)
             await self._save_meta(ctx, category, target_key, meta, lease)
             return version
+
+    async def merge_values(
+        self,
+        ctx: RequestContext,
+        category: str,
+        target_key: str,
+        values: dict[str, Any],
+        updated_by: str = "",
+        change_reason: str = "",
+    ) -> UserPrivacyConfigVersion:
+        """Add values to the current snapshot, keeping existing keys referenced elsewhere.
+
+        Read, merge and write share one lock so concurrent writers cannot drop
+        each other's values.
+        """
+        return await self._upsert(
+            ctx,
+            category,
+            target_key,
+            values,
+            updated_by=updated_by,
+            change_reason=change_reason,
+            merge=True,
+        )
 
     async def activate_version(
         self,
