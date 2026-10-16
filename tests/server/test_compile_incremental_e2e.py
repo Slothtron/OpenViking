@@ -4,10 +4,14 @@ Runtime is not called: the test drives the provider hooks the queue worker would
 run, so it checks the kernel half (registry, snapshots, change plan, finish).
 """
 
+from datetime import datetime
+
 import pytest
 
 from openviking.server.identity import RequestContext, Role
+from openviking.service.compile_scheduler import TZ, current_slot, next_slot
 from openviking.service.compile_service import CompileRequest
+from openviking.service.compile_targets import parse_schedule
 from openviking.service.external_task_service import ExternalTaskSnapshot
 from openviking.service.task_tracker import get_task_tracker
 from openviking_cli.session.user_id import UserIdentifier
@@ -39,6 +43,21 @@ async def _run(service, ctx, *, write_page=None):
             await _write(service, f"{TO}/page.md", write_page, ctx)
         await compile_service.on_finish(task, ExternalTaskSnapshot(status="completed"))
     return started, changes
+
+
+def test_schedule_slots():
+    def at(day, hour, minute):
+        return datetime(2026, 10, day, hour, minute, tzinfo=TZ)
+
+    daily = parse_schedule({"frequency": "daily", "hour": 2, "minute": 30})
+    assert current_slot(daily, at(13, 2, 29)) == at(12, 2, 30)
+    assert current_slot(daily, at(13, 2, 30)) == at(13, 2, 30)
+    assert next_slot(daily, at(13, 2, 30)) == at(14, 2, 30)
+    # 2026-10-13 is a Tuesday; weekly defaults to Monday 00:00.
+    assert current_slot(parse_schedule({"frequency": "weekly"}), at(13, 1, 0)) == at(12, 0, 0)
+    sunday = parse_schedule({"frequency": "weekly", "weekday": 7, "hour": 23, "minute": 59})
+    assert current_slot(sunday, at(13, 1, 0)) == at(11, 23, 59)
+    assert next_slot(sunday, at(13, 1, 0)) == at(18, 23, 59)
 
 
 @pytest.mark.asyncio
