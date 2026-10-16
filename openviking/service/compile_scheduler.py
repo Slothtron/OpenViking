@@ -72,25 +72,28 @@ def is_due(record: Dict[str, Any], slot: datetime) -> bool:
 
 
 async def encrypt_credential(encryptor: Any, ctx: RequestContext) -> Dict[str, str]:
+    from openviking.crypto.exceptions import ConfigError
+
     if not ctx.api_key:
         raise FailedPreconditionError(
             "Scheduled Compile requires an OpenViking API key",
             details={"reason": "COMPILE_CREDENTIAL_INVALID"},
         )
     plaintext = json.dumps({"api_key": ctx.api_key}).encode("utf-8")
-    ciphertext = await encryptor.encrypt(ctx.account_id, plaintext)
+    try:
+        ciphertext = await encryptor.encrypt(ctx.account_id, plaintext)
+    except (OSError, ConfigError) as exc:
+        # e.g. the default ~/.openviking/master.key cannot be created or read.
+        raise FailedPreconditionError(
+            "Cannot load the credential encryption key; configure a readable and writable "
+            f"encryption.local.key_file, or another encryption.provider: {exc}",
+            details={"reason": "COMPILE_CREDENTIAL_KEY_UNAVAILABLE"},
+        ) from exc
     return {"provider": CREDENTIAL_PROVIDER, "ciphertext": base64.b64encode(ciphertext).decode()}
 
 
 def build_credential_encryptor(encryption_config: Any) -> Any:
-    """FileEncryptor for scheduled-Compile API keys, independent of ``encryption.enabled``.
-
-    ``encryption.enabled`` turns on encryption of all AGFS content, which changes
-    every other feature's storage. Compile credentials only need the configured
-    root-key provider (``~/.openviking/master.key`` by default), so they always
-    use it. With ``enabled=true`` this is the same provider and root key as the
-    AGFS encryptor, so the ciphertexts are interchangeable.
-    """
+    """Encryptor for saved API keys; unlike AGFS encryption, ignores ``encryption.enabled``."""
     from openviking.crypto.encryptor import FileEncryptor
     from openviking.crypto.providers import create_root_key_provider
 
@@ -125,14 +128,7 @@ class CompileScheduler:
         self._identity_resolver = resolver
 
     async def save_credential(self, ctx: RequestContext) -> tuple[Dict[str, Any], Dict[str, str]]:
-        """Return ``(executor, credential)`` to store when enabling scheduled updates.
-
-        The executor is the request's effective user. ``key_type`` is ``root`` when
-        the key is the server root key: only a trusted-mode request can use it for
-        data access (it asserted the user via ``X-OpenViking-Account/User``); an
-        ``api_key``-mode request never reaches here with a root key, since data
-        routes reject it with 403.
-        """
+        """Return ``(executor, credential)``; a trusted-mode root key is saved as ``key_type=root``."""
         key_type = "user"
         if self._identity_resolver is not None and ctx.api_key:
             try:
@@ -262,12 +258,10 @@ class CompileScheduler:
         return outcome
 
     async def _executor(self, record: Dict[str, Any]) -> tuple[RequestContext, Dict[str, Any]]:
-        """Decrypt the saved key and verify it still authorizes the saved executor.
+        """Decrypt the saved key and check it still authorizes the saved executor.
 
-        A user key must still resolve to the saved account and user. A root key
-        (trusted mode) resolves to no user; it stays valid while it is the root
-        key, and the run acts as the saved executor, as trusted requests do with
-        ``X-OpenViking-Account`` / ``X-OpenViking-User``.
+        A user key must resolve to the same user; a root key must still be the
+        root key, and the run acts as the saved user (as trusted requests do).
         """
         context = record["execution_context"]
         executor, credential = context.get("executor"), context.get("credential")

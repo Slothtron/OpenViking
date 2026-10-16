@@ -248,3 +248,30 @@ async def test_trusted_root_key_runs_as_the_asserted_user():
     assert await scheduler.trigger_if_due("acme", target_id, now) == "submitted"
     connection = submitted[0][1]
     assert (connection["account_id"], connection["user_id"]) == ("acme", "alice")
+
+
+@pytest.mark.asyncio
+async def test_enabling_schedule_fails_with_412_when_it_cannot_be_saved(tmp_path):
+    from openviking.service.compile_scheduler import build_credential_encryptor
+    from openviking_cli.exceptions import FailedPreconditionError
+    from openviking_cli.utils.config.encryption_config import EncryptionConfig
+
+    body = {"from": [SRC], "to": TO, "skill": SKILL, "args": {"auto_update": True}}
+
+    # A read replica (no scheduler) refuses, so it never encrypts with its own key.
+    lifecycle = CompileLifecycle(CompileStateStore(_Agfs()), _GitFs())
+    with pytest.raises(FailedPreconditionError) as replica:
+        await lifecycle.prepare(dict(body), CTX, instruction_set=False)
+    assert replica.value.details["reason"] == "COMPILE_SCHEDULER_DISABLED"
+
+    # An unwritable key directory is a configuration problem, not a server error.
+    blocked = tmp_path / "ro"
+    blocked.mkdir(mode=0o555)
+    scheduler = CompileScheduler(SimpleNamespace(), lifecycle._store, lifecycle._fs)
+    scheduler.credential_encryptor = build_credential_encryptor(
+        EncryptionConfig(local={"key_file": str(blocked / ".openviking" / "master.key")})
+    )
+    lifecycle.save_credential = scheduler.save_credential
+    with pytest.raises(FailedPreconditionError) as unwritable:
+        await lifecycle.prepare(dict(body), CTX, instruction_set=False)
+    assert unwritable.value.details["reason"] == "COMPILE_CREDENTIAL_KEY_UNAVAILABLE"
