@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping
+from typing import Any, Mapping
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, model_validator
@@ -14,7 +14,7 @@ from openviking.core.namespace import classify_uri, uri_parts
 from openviking.core.path_variables import resolve_path_variables
 from openviking.core.uri_validation import validate_request_viking_uri
 from openviking.server.identity import RequestContext
-from openviking.service.compile_targets import CompileLifecycle
+from openviking.service.compile_targets import CompileLifecycle, UpdateSchedule
 from openviking.service.external_task_service import (
     ExternalTaskError,
     ExternalTaskService,
@@ -49,7 +49,7 @@ class CompileConfigUpdate(BaseModel):
     skill: str = Field(min_length=1)
     instruction: str | None = None
     auto_update: bool
-    update_frequency: Literal["daily", "weekly"]
+    update_schedule: UpdateSchedule
 
     @property
     def instruction_sent(self) -> bool:
@@ -565,7 +565,7 @@ class CompileService:
             "skill": record["skill"],
             "instruction": record["instruction"],
             "auto_update": record["auto_update"],
-            "update_frequency": record["update_frequency"],
+            "update_schedule": record["update_schedule"],
             "next_run_at": next_run_at(dict(record)),
             "last_run": record["last_run"],
             "last_error": record["last_error"],
@@ -591,7 +591,9 @@ class CompileService:
             lifecycle.apply_sources(record, request.from_, request.skill)
             if body.instruction_sent:
                 record["instruction"] = (body.instruction or "").strip() or None
-            await lifecycle.apply_schedule(record, ctx, body.auto_update, body.update_frequency)
+            await lifecycle.apply_schedule(
+                record, ctx, body.auto_update, body.update_schedule.model_dump()
+            )
         if lifecycle.reschedule is not None:
             await lifecycle.reschedule(ctx.account_id, record)
         return self._config_view(record)
@@ -614,7 +616,7 @@ class CompileService:
                     "initialized": item["initialized"],
                     "running": item["running"],
                     "auto_update": item["auto_update"],
-                    "update_frequency": item["update_frequency"],
+                    "update_schedule": item["update_schedule"],
                     "next_run_at": next_run_at(item),
                 }
             )

@@ -505,7 +505,7 @@ async def test_root_key_cannot_enable_compile_schedule(auth_client: httpx.AsyncC
             "from": ["viking://resources/src"],
             "to": "viking://resources/wiki",
             "skill": "viking://agent/skills/wiki",
-            "args": {"auto_update": True, "update_frequency": "daily"},
+            "args": {"auto_update": True, "update_schedule": {"frequency": "daily"}},
         },
     )
     assert resp.status_code == 403

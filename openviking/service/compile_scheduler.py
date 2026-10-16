@@ -4,7 +4,7 @@
 
 ``trigger_if_due`` owns the decision and submission under the target record
 lock. Backends only discover candidates: ``local`` scans each account's
-targets.json hourly; ``redis`` registers each target's next slot with the
+targets.json every minute; ``redis`` registers each target's next slot with the
 distributed ExpiryScheduler and also runs a slower compensation scan, because
 the record (not Redis) is the source of truth.
 """
@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
@@ -28,7 +29,7 @@ logger = get_logger(__name__)
 
 TZ = ZoneInfo("Asia/Shanghai")
 COMPILE_TARGET_ITEM_TYPE = "compile_target"
-LOCAL_SCAN_SECONDS = 3600.0
+LOCAL_SCAN_SECONDS = 60.0
 COMPENSATION_SCAN_SECONDS = 6 * 3600.0
 CREDENTIAL_PROVIDER = "encrypted_api_key"
 
@@ -37,23 +38,27 @@ def now_iso(now: Optional[datetime] = None) -> str:
     return (now or datetime.now(TZ)).astimezone(TZ).isoformat()
 
 
-def current_slot(frequency: str, now: datetime) -> datetime:
-    """Most recent Beijing-time 00:00 (daily) or Monday 00:00 (weekly) not after ``now``."""
+def _period(schedule: Dict[str, Any]) -> timedelta:
+    return timedelta(days=7 if schedule["frequency"] == "weekly" else 1)
+
+
+def current_slot(schedule: Dict[str, Any], now: datetime) -> datetime:
+    """Most recent Beijing-time trigger of ``schedule`` not after ``now``."""
     local = now.astimezone(TZ)
-    slot = local.replace(hour=0, minute=0, second=0, microsecond=0)
-    if frequency == "weekly":
-        slot -= timedelta(days=slot.weekday())
-    return slot
+    slot = local.replace(hour=schedule["hour"], minute=schedule["minute"], second=0, microsecond=0)
+    if schedule["frequency"] == "weekly":
+        slot -= timedelta(days=(local.isoweekday() - schedule["weekday"]) % 7)
+    return slot - _period(schedule) if slot > local else slot
 
 
-def next_slot(frequency: str, now: datetime) -> datetime:
-    return current_slot(frequency, now) + timedelta(days=7 if frequency == "weekly" else 1)
+def next_slot(schedule: Dict[str, Any], now: datetime) -> datetime:
+    return current_slot(schedule, now) + _period(schedule)
 
 
 def next_run_at(record: Dict[str, Any], now: Optional[datetime] = None) -> Optional[str]:
     if not (record.get("auto_update") and record.get("initialized")):
         return None
-    return next_slot(record["update_frequency"], now or datetime.now(TZ)).isoformat()
+    return next_slot(record["update_schedule"], now or datetime.now(TZ)).isoformat()
 
 
 def is_due(record: Dict[str, Any], slot: datetime) -> bool:
@@ -164,12 +169,16 @@ class CompileScheduler:
             self._task = None
 
     async def _run(self) -> None:
-        interval = COMPENSATION_SCAN_SECONDS if self._backend == "redis" else LOCAL_SCAN_SECONDS
         while not self._stop.is_set():
             try:
                 await self.scan_once()
             except Exception:
                 logger.exception("Compile scheduler scan failed")
+            if self._backend == "redis":
+                interval = COMPENSATION_SCAN_SECONDS
+            else:
+                # Wake 1s after the next minute boundary, where slots fall.
+                interval = LOCAL_SCAN_SECONDS + 1 - time.time() % LOCAL_SCAN_SECONDS
             try:
                 await asyncio.wait_for(self._stop.wait(), interval)
             except asyncio.TimeoutError:
@@ -182,7 +191,7 @@ class CompileScheduler:
         for account_id in await self._store.list_accounts():
             for item in await self._store.list_summaries(account_id):
                 try:
-                    if is_due(item, current_slot(item["update_frequency"], now)):
+                    if is_due(item, current_slot(item["update_schedule"], now)):
                         await self.trigger_if_due(account_id, item["id"], now)
                     elif self._backend == "redis" and item.get("auto_update"):
                         await self.reschedule(account_id, item)
@@ -202,13 +211,13 @@ class CompileScheduler:
                 and record.get("initialized")
                 and record.get("auto_update")
             ):
-                frequency = record["update_frequency"]
-                due = next_slot(frequency, datetime.now(TZ))
+                schedule = record["update_schedule"]
+                due = next_slot(schedule, datetime.now(TZ))
                 await self._expiry.report(
                     ExpiryRegistration(
                         identity=identity,
                         due_at_ms=int(due.timestamp() * 1000),
-                        timeout_seconds=604800 if frequency == "weekly" else 86400,
+                        timeout_seconds=int(_period(schedule).total_seconds()),
                         mode=ExpiryMode.IDLE_ONESHOT,
                     )
                 )
@@ -226,7 +235,7 @@ class CompileScheduler:
         """Submit the target's scheduled task for the current slot at most once."""
         now = now or datetime.now(TZ)
         async with self._store.edit(account_id, target_id) as record:
-            slot = current_slot(record["update_frequency"], now)
+            slot = current_slot(record["update_schedule"], now)
             if not is_due(record, slot):
                 return "not_due"
             slot_iso = slot.isoformat()

@@ -24,8 +24,22 @@ import json
 import random
 import time
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional
+from typing import (
+    Annotated,
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Union,
+)
 from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from openviking.pyagfs import AsyncAGFSClient
 from openviking.pyagfs.async_client import fs_ctx_from_agfs_path
@@ -64,7 +78,7 @@ SUMMARY_FIELDS = (
     "status",
     "initialized",
     "auto_update",
-    "update_frequency",
+    "update_schedule",
     "auto_update_enabled_at",
     "last_triggered_slot",
 )
@@ -81,7 +95,7 @@ def new_record(target_id: str, to: str) -> Dict[str, Any]:
         "instruction": None,
         "initialized": False,
         "auto_update": False,
-        "update_frequency": "daily",
+        "update_schedule": dict(DEFAULT_SCHEDULE),
         "auto_update_enabled_at": None,
         "last_triggered_slot": None,
         "last_error": None,
@@ -283,8 +297,7 @@ class CompileStateStore:
 # ==========================================================================
 
 
-CONTROL_ARGS = ("mode", "auto_update", "update_frequency")
-FREQUENCIES = ("daily", "weekly")
+CONTROL_ARGS = ("mode", "auto_update", "update_schedule")
 MAX_SCOPES = 1000
 GIT_RETRIES = 3
 SNAPSHOT_BUSY_SECONDS = 30.0
@@ -305,14 +318,43 @@ def overlaps(a: str, b: str) -> bool:
     return a == b or a.startswith(f"{b}/") or b.startswith(f"{a}/")
 
 
+class DailySchedule(BaseModel):
+    """Beijing-time trigger time; weekly adds ``weekday`` (1=Monday … 7=Sunday)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    frequency: Literal["daily"]
+    hour: int = Field(default=0, ge=0, le=23)
+    minute: int = Field(default=0, ge=0, le=59)
+
+
+class WeeklySchedule(DailySchedule):
+    frequency: Literal["weekly"]
+    weekday: int = Field(default=1, ge=1, le=7)
+
+
+UpdateSchedule = Annotated[Union[DailySchedule, WeeklySchedule], Field(discriminator="frequency")]
+DEFAULT_SCHEDULE = {"frequency": "daily", "hour": 0, "minute": 0}
+
+
+def parse_schedule(value: Any) -> Dict[str, Any]:
+    """Validate a schedule and fill defaults."""
+    try:
+        return TypeAdapter(UpdateSchedule).validate_python(value).model_dump()
+    except ValidationError as exc:
+        error = exc.errors(include_url=False)[0]
+        field = "".join(f".{part}" for part in error["loc"][1:])  # loc[0] is the frequency tag
+        raise InvalidArgumentError(f"args.update_schedule{field}: {error['msg']}") from exc
+
+
 def split_control_args(args: Optional[Mapping[str, Any]]) -> tuple[dict, dict]:
     """Separate kernel control args from Runtime args."""
     runtime = dict(args or {})
     control = {key: runtime.pop(key) for key in CONTROL_ARGS if key in runtime}
     if control.get("mode", "incremental") not in {"incremental", "full"}:
         raise InvalidArgumentError("args.mode must be 'incremental' or 'full'")
-    if control.get("update_frequency", "daily") not in FREQUENCIES:
-        raise InvalidArgumentError("args.update_frequency must be 'daily' or 'weekly'")
+    if "update_schedule" in control:
+        control["update_schedule"] = parse_schedule(control["update_schedule"])
     if not isinstance(control.get("auto_update", False), bool):
         raise InvalidArgumentError("args.auto_update must be a boolean")
     return control, runtime
@@ -438,12 +480,12 @@ class CompileLifecycle:
             persisted = {k: v for k, v in runtime_args.items() if k != "last_compile_time"}
             if persisted:
                 record["execution_context"]["args"] = persisted
-            if "auto_update" in control or "update_frequency" in control:
+            if "auto_update" in control or "update_schedule" in control:
                 await self.apply_schedule(
                     record,
                     ctx,
                     control.get("auto_update", record["auto_update"]),
-                    control.get("update_frequency", record["update_frequency"]),
+                    control.get("update_schedule", record["update_schedule"]),
                 )
         if self.reschedule is not None:
             await self.reschedule(ctx.account_id, record)
@@ -468,11 +510,15 @@ class CompileLifecycle:
         record["skill"] = skill
 
     async def apply_schedule(
-        self, record: Dict[str, Any], ctx: RequestContext, auto_update: bool, frequency: str
+        self,
+        record: Dict[str, Any],
+        ctx: RequestContext,
+        auto_update: bool,
+        schedule: Dict[str, Any],
     ) -> None:
         from openviking.service.compile_scheduler import now_iso
 
-        changed = auto_update != record["auto_update"] or frequency != record["update_frequency"]
+        changed = auto_update != record["auto_update"] or schedule != record["update_schedule"]
         if auto_update:
             if self.save_credential is None:
                 # Credentials are encrypted only on scheduler instances, where they are decrypted.
@@ -490,7 +536,7 @@ class CompileLifecycle:
         if changed:
             record["auto_update_enabled_at"] = now_iso() if auto_update else None
         record["auto_update"] = auto_update
-        record["update_frequency"] = frequency
+        record["update_schedule"] = schedule
 
     async def record_queued(self, task: Any) -> None:
         """Create the queued run so other instances see the task before it starts."""
