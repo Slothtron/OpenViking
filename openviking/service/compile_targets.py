@@ -475,11 +475,10 @@ class CompileLifecycle:
         changed = auto_update != record["auto_update"] or frequency != record["update_frequency"]
         if auto_update:
             if self.save_credential is None:
-                # Credentials are encrypted only where they are decrypted, so read
-                # replicas (scheduler_enabled=false) never use a different key.
+                # Credentials are encrypted only on scheduler instances, where they are decrypted.
                 raise FailedPreconditionError(
-                    "Scheduled Compile is disabled on this instance; send update settings "
-                    "to an instance with compile_api.scheduler_enabled=true",
+                    "Scheduled Compile is disabled on this instance "
+                    "(compile_api.scheduler_enabled=false)",
                     details={"reason": "COMPILE_SCHEDULER_DISABLED"},
                 )
             executor, credential = await self.save_credential(ctx)

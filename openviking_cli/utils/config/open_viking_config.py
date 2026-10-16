@@ -179,7 +179,7 @@ class CompileApiConfig(BaseModel):
     gateway_token: str = ""
     http_timeout_seconds: float = 10.0
     poll_interval_ms: int = 30000
-    # Run CompileScheduler on this instance; disable on read-only replicas.
+    # Run CompileScheduler on this instance.
     scheduler_enabled: bool = True
     # How due targets are discovered: hourly scan (local) or ExpiryScheduler callbacks (redis).
     scheduler_backend: Literal["local", "redis"] = "local"
