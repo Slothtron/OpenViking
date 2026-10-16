@@ -34,6 +34,7 @@ from vikingbot.agent.loop import (
     _PlainTextDelivered,
 )
 from vikingbot.agent.subagent import SubagentManager
+from vikingbot.agent.tools.base import ToolContext
 from vikingbot.agent.tools.compile import (
     CompileChildTool,
     CompileSpawnTool,
@@ -812,6 +813,9 @@ class BotCompileService:
                     source_files=source_files,
                     usage=agent_usage,
                     agent_runner=run_focused_agent,
+                    tool_context=ToolContext(
+                        session_key=session_key, openviking_connection=connection
+                    ),
                 )
                 return
             source_roots = {
@@ -1014,6 +1018,7 @@ class BotCompileService:
         source_files,
         usage,
         agent_runner=None,
+        tool_context=None,
         resume=False,
     ) -> bool:
         """Run the shared collection pipeline and publish through the target namespace API.
@@ -1036,6 +1041,12 @@ class BotCompileService:
             usage=usage,
         )
         pipeline.model.agent_runner = agent_runner
+        pipeline.tools = {
+            name: tool
+            for name in ("openviking_search", "openviking_multi_read")
+            if (tool := self.agent_loop.tools.get(name)) is not None
+        }
+        pipeline.tool_context = tool_context
 
         def record_metrics(task):
             """Expose token totals and existing error summaries, without per-call counters."""

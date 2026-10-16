@@ -52,6 +52,7 @@ The user message contains a JSON object with the following fields:
 - request.instruction: the user's requirements for this compile task.
 - request.to: the destination for the generated outputs.
 - target_has_content: whether request.to contains any visible files or subdirectories.
+- changes: when present, this is an incremental Compile; scopes identifies changed sources.
 - source_summary: file counts, sizes and splitting statistics; sizes are Unicode characters.
 - runtime.time: the task timestamp for interpreting relative dates in the request.
 
@@ -90,6 +91,13 @@ class Pipeline:
     ):
         self.client, self.limits, self.request = client, limits, request
         self.target, self.skill = request.to, skill
+        self.changes = (
+            {k: v for k, v in request.changes.items() if k != "candidate_output_scopes"}
+            if request.changes is not None
+            else None
+        )
+        self.tools = {}
+        self.tool_context = None
         self.skill_target = classify_uri(self.target).context_type == "skill"
         self.files = TaskFiles(sandbox)
         self.metrics: Counter = Counter()
@@ -181,6 +189,8 @@ class Pipeline:
                 "source_summary": source_summary,
                 "target_has_content": target_has_content,
             }
+            if self.changes is not None:
+                planning_context["changes"] = self.changes
             direct = await entry.run(self, sources, planning_context)
             if direct is not None:
                 result = await finalize_op.run(self, direct)
@@ -207,6 +217,8 @@ class Pipeline:
                 + json.dumps(prompt_runtime)
                 + "\n"
             )
+            if self.changes is not None:
+                self.system += "\n# Incremental source changes\n" + json.dumps(self.changes)
             await self.files.put(
                 "contract",
                 {

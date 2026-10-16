@@ -27,8 +27,6 @@ class CompileLimits(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    # Estimated complete input tokens, including tools and repair/read history, before planning.
-    direct_input_tokens: int = Field(default=110_000, ge=1)
     # Soft request budget for prompt, input JSON, emit schema and estimated output space.
     # Larger indivisible records may exceed it; this is not the model's token limit.
     merge_input_chars: int = Field(default=60_000, ge=1)

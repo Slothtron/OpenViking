@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import itertools
 import json
 import tempfile
@@ -288,6 +289,12 @@ class VikingSearchTool(OVFileTool):
                     "description": "Minimum relevance score threshold",
                     "default": 0.35,
                 },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum candidates per search scope; increase if needed.",
+                    "minimum": 1,
+                    "default": 10,
+                },
             },
             "required": ["query"],
         }
@@ -425,6 +432,7 @@ class VikingSearchTool(OVFileTool):
         query: str,
         target_uri: Optional[str] = "",
         min_score: float = 0.35,
+        limit: int = 10,
         **kwargs: Any,
     ) -> str:
         client = None
@@ -496,7 +504,7 @@ class VikingSearchTool(OVFileTool):
             for search_target_uri, search_user_id in search_targets:
                 search_kwargs = {
                     "target_uri": search_target_uri,
-                    "limit": 10,
+                    "limit": limit,
                 }
                 if search_user_id:
                     search_kwargs["user_id"] = search_user_id
@@ -990,8 +998,10 @@ class VikingMultiReadTool(OVFileTool):
         uris: list[str],
         offset: int = 0,
         limit: int = -1,
+        with_revision: bool = False,
         **kwargs: Any,
     ) -> str | MultimodalToolResult:
+        """Read content; with_revision returns raw UTF-8 ranges and full-file hashes as JSON."""
         level = "read"  # 默认获取完整内容
         client = None
         try:
@@ -1011,6 +1021,10 @@ class VikingMultiReadTool(OVFileTool):
                 async with semaphore:
                     try:
                         media_kind = self._media_kind(uri)
+                        if with_revision and (
+                            media_kind or offset < 0 or (limit != -1 and limit < 1)
+                        ):
+                            raise ValueError("Revision reads require text files and valid line ranges")
                         if media_kind == "image":
                             if index not in inline_image_indexes:
                                 return {
@@ -1118,6 +1132,17 @@ class VikingMultiReadTool(OVFileTool):
                                     "success": False,
                                     "media_kind": None,
                                 }
+                        if with_revision:
+                            raw = await client.download_bytes(uri)
+                            lines = raw.decode("utf-8").splitlines(keepends=True)
+                            return {
+                                "uri": uri,
+                                "content": "".join(
+                                    lines[offset:] if limit == -1 else lines[offset : offset + limit]
+                                ),
+                                "base_hash": hashlib.sha256(raw).hexdigest(),
+                                "success": True,
+                            }
                         content = await client.read_content(
                             uri, level=level, offset=offset, limit=limit
                         )
@@ -1144,6 +1169,8 @@ class VikingMultiReadTool(OVFileTool):
             # 并发读取所有URI
             read_tasks = [read_single_uri(index, uri) for index, uri in enumerate(uris)]
             results = await asyncio.gather(*read_tasks)
+            if with_revision:
+                return json.dumps(results, ensure_ascii=False)
 
             inline_media_bytes = 0
             for result in results:
