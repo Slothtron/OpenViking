@@ -66,6 +66,26 @@ class _MemoryPrivacyStorage:
 
 
 @pytest.mark.asyncio
+async def test_merge_values_preserves_snapshot_history():
+    privacy = UserPrivacyConfigService(_MemoryPrivacyStorage())
+    ctx = RequestContext(user=UserIdentifier.the_default_user("privacy_merge"), role=Role.ROOT)
+    for added, expected, version in [
+        ({"one": "secret-1"}, {"one": "secret-1"}, 1),
+        ({"one": "secret-1"}, {"one": "secret-1"}, 1),
+        ({"two": "secret-2"}, {"one": "secret-1", "two": "secret-2"}, 2),
+    ]:
+        result = await privacy.merge_values(ctx, "session", "demo", added)
+        assert result.values == expected
+        assert result.version == version
+
+    await privacy.activate_version(ctx, "session", "demo", 1)
+    result = await privacy.merge_values(ctx, "session", "demo", {"three": "secret-3"})
+    assert result.version == 3
+    assert result.values == {"one": "secret-1", "three": "secret-3"}
+    assert await privacy.list_versions(ctx, "session", "demo") == [1, 2, 3]
+
+
+@pytest.mark.asyncio
 async def test_privacy_config_service_versions(service):
     ctx = RequestContext(user=UserIdentifier.the_default_user("privacy_user"), role=Role.ROOT)
     await service.initialize_user_directories(ctx)
