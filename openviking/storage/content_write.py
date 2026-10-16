@@ -11,7 +11,7 @@ import hashlib
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from openviking.core.context import ContextLevel
 from openviking.core.namespace import (
@@ -209,10 +209,21 @@ class ContentWriteCoordinator:
         viking_fs: VikingFS,
         vikingdb: Any = None,
         privacy_sanitizer: PrivacySanitizer | None = None,
+        commit_content: Callable[..., Awaitable[Any]] | None = None,
     ):
         self._viking_fs = viking_fs
         self._vikingdb = vikingdb
         self._privacy_sanitizer = privacy_sanitizer
+        self._content_commit = commit_content
+
+    async def _commit_content(self, uris: list[str], lease: Any, write=None) -> Any:
+        """Write bytes and managed versions under the lease before refresh.
+
+        Return ``write()``'s result; batches omit it because bytes are already written.
+        """
+        if self._content_commit is not None:
+            return await self._content_commit(uris, lease_ref=lease, write=write)
+        return await write() if write is not None else None
 
     async def _sanitize_text(
         self,
@@ -584,6 +595,7 @@ class ContentWriteCoordinator:
                     created.append(uri)
                     if prepared is None:
                         refresh_kinds[uri] = "added"
+            await self._commit_content([*created, *updated], lease)
         except BaseException:
             await self._viking_fs._async_agfs.pathlock_release(lease)
             raise
@@ -1629,6 +1641,16 @@ class ContentWriteCoordinator:
                 ingest_options=ingest_options,
             )
 
+            await self._commit_content(
+                [uri],
+                lease,
+                lambda: execute_content_tree_actions(
+                    prepared.plan.content_tree_actions,
+                    store=prepared.store,
+                    artifact_ref=prepared.artifact_ref,
+                    target=prepared.target,
+                ),
+            )
             has_async_work = bool(
                 prepared.plan.direct_index_actions or prepared.plan.file_refresh is not None
             )
@@ -1641,7 +1663,7 @@ class ContentWriteCoordinator:
                     lease=lease,
                 )
             work = await commit_and_enqueue_plan(
-                prepared.plan,
+                replace(prepared.plan, content_tree_actions=()),
                 ctx=ctx,
                 inline_store=prepared.store,
                 inline_ref=prepared.artifact_ref,
@@ -2145,10 +2167,8 @@ class ContentWriteCoordinator:
             }
             if is_new_file:
                 write_kwargs["is_new_file"] = True
-            final_bytes = await self._write_in_place(
-                uri,
-                content,
-                **write_kwargs,
+            final_bytes = await self._commit_content(
+                [uri], lease, lambda: self._write_in_place(uri, content, **write_kwargs)
             )
             written_bytes = len(final_bytes)
             await self._viking_fs._async_agfs.pathlock_release(lease)

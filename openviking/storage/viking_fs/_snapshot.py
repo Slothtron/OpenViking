@@ -205,6 +205,7 @@ class _SnapshotMixin:
         author_name: Optional[str] = None,
         author_email: Optional[str] = None,
         ctx: Optional[RequestContext] = None,
+        lease_ref: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a git snapshot of the account's tree.
 
@@ -220,6 +221,7 @@ class _SnapshotMixin:
             branch: Branch to advance. Defaults to ``"main"``.
             author_name / author_email: Override the default bot author.
             ctx: Request context (provides ``account_id``).
+            lease_ref: Existing content lease whose ownership the snapshot shares.
 
         Returns:
             Dict with ``result`` (``"created"`` / ``"noop"``) and ``commit_oid``.
@@ -287,7 +289,8 @@ class _SnapshotMixin:
         lease = None
         if lock_requests:
             try:
-                lease = await self._async_agfs.pathlock_acquire_batch(lock_requests)
+                lock_options = {"owner_lease_ref": lease_ref} if lease_ref is not None else {}
+                lease = await self._async_agfs.pathlock_acquire_batch(lock_requests, **lock_options)
             except LockAcquisitionError as exc:
                 raise ResourceBusyError(
                     "A snapshot path is being processed",

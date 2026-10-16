@@ -9,6 +9,7 @@ Provides file system operations: ls, mkdir, rm, mv, tree, stat, read, abstract, 
 import asyncio
 from collections.abc import Coroutine
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional
 
 from openviking.core.context import ContextLevel
@@ -1277,17 +1278,22 @@ class FSService:
         acl: AclSpec | Dict[str, Any] | None = None,
         edit_source: Literal["manual", "agent"] = "agent",
         record_version: bool = True,
+        commit_content: Optional[Callable[..., Awaitable[Any]]] = None,
     ) -> Dict[str, Any]:
-        """Create or update a file and refresh semantics/vectors.
+        """Write content and refresh it after persisting managed output versions.
 
-        Writes to a Compile output file also record a file version, unless the
-        caller records its own (single-file restore).
+        Internal restores supply ``commit_content`` to record their own version.
         """
         viking_fs = self._ensure_initialized()
+        if commit_content is None and record_version and self.compile_versions is not None:
+            commit_content = partial(
+                self.compile_versions.record_write, ctx=ctx, edit_source=edit_source
+            )
         coordinator = ContentWriteCoordinator(
             viking_fs=viking_fs,
             vikingdb=self._vikingdb,
             privacy_sanitizer=self._privacy_sanitizer,
+            commit_content=commit_content,
         )
         result = await coordinator.write(
             uri=uri,
@@ -1300,8 +1306,6 @@ class FSService:
             tag_mode=tag_mode,
             acl=acl,
         )
-        if record_version and self.compile_versions is not None:
-            await self.compile_versions.record_write([result["uri"]], ctx, edit_source)
         return result
 
     async def batch_write(
@@ -1320,6 +1324,11 @@ class FSService:
             viking_fs=viking_fs,
             vikingdb=self._vikingdb,
             privacy_sanitizer=self._privacy_sanitizer,
+            commit_content=(
+                partial(self.compile_versions.record_write, ctx=ctx, edit_source="agent")
+                if self.compile_versions is not None
+                else None
+            ),
         )
         result = await coordinator.batch_write(
             root_uri=root_uri,
@@ -1329,9 +1338,6 @@ class FSService:
             skip_conflicts=skip_conflicts,
             processing_mode=processing_mode,
         )
-        if self.compile_versions is not None:
-            written = [*result.get("created", []), *result.get("updated", [])]
-            await self.compile_versions.record_write(written, ctx, "agent")
         return result
 
     async def set_tags(

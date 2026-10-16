@@ -746,7 +746,12 @@ async def retry_git(action: Any) -> Any:
 
 
 async def commit_snapshot(
-    viking_fs: Any, paths: List[str], message: str, ctx: RequestContext
+    viking_fs: Any,
+    paths: List[str],
+    message: str,
+    ctx: RequestContext,
+    *,
+    lease_ref: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Return the snapshot oid, or None when Git is disabled (Compile then runs in full).
 
@@ -754,10 +759,11 @@ async def commit_snapshot(
     path is retried until ``SNAPSHOT_BUSY_SECONDS`` elapse.
     """
     deadline = time.monotonic() + SNAPSHOT_BUSY_SECONDS
+    kwargs = {"lease_ref": lease_ref} if lease_ref is not None else {}
     while True:
         try:
             result = await retry_git(
-                lambda: viking_fs.commit(message=message, paths=paths, ctx=ctx)
+                lambda: viking_fs.commit(message=message, paths=paths, ctx=ctx, **kwargs)
             )
             break
         except AGFSNotSupportedError:
@@ -955,13 +961,21 @@ class CompileVersions:
                     source_roots=list((index or {}).get("source_roots") or record["from"]),
                 )
 
-    async def record_write(self, uris: List[str], ctx: RequestContext, edit_source: str) -> None:
-        """After content/write: snapshot written output files and add one version each.
+    async def record_write(
+        self,
+        uris: List[str],
+        ctx: RequestContext,
+        edit_source: str,
+        *,
+        lease_ref: Optional[Dict[str, Any]] = None,
+        write: Optional[Callable[[], Awaitable[Any]]] = None,
+    ) -> Any:
+        """Write and version managed outputs before refresh, returning the write result.
 
-        Writes while the target runs a Compile are left to that task's finish
-        snapshot, so Agent output is versioned once as ``compile``. Edited files
-        become self-bound and are no longer candidates for source changes.
+        Active Compile records its own versions; other edits become self-bound.
+        Batch URIs are already written and omit ``write``.
         """
+        written = await write() if write is not None else None
         grouped: Dict[str, List[str]] = {}
         for uri in uris:
             record = await self.owning_target(ctx.account_id, uri)
@@ -973,7 +987,7 @@ class CompileVersions:
                 continue
             grouped.setdefault(record["id"], []).append(uri)
         for target_id, targets in grouped.items():
-            snapshot = await self._commit(targets, f"{edit_source} edit", ctx)
+            snapshot = await self._commit(targets, f"{edit_source} edit", ctx, lease_ref=lease_ref)
             for uri in targets:
                 if snapshot and await self._changed(ctx.account_id, target_id, uri, snapshot):
                     await self.append(
@@ -988,6 +1002,7 @@ class CompileVersions:
                         },
                         source_roots=[uri],
                     )
+        return written
 
     async def _changed(self, account_id: str, target_id: str, uri: str, snapshot: str) -> bool:
         """Whether ``uri`` in ``snapshot`` differs from its latest version's content.
@@ -1151,55 +1166,72 @@ class CompileVersions:
         source_version: str,
         expected_version: str,
         ctx: RequestContext,
-        write: Callable[[bytes], Awaitable[Any]],
+        write: Callable[[bytes, Callable[..., Awaitable[Any]]], Awaitable[Any]],
     ) -> Dict[str, Any]:
-        """Write an earlier version back through ``write`` and record a ``restore`` version.
+        """Restore immutable historical bytes as a new version before refresh.
 
-        ``write`` is the content/write path, so summaries and indexes refresh as
-        for a normal edit. The version checks run under the version index lock,
-        which also serializes concurrent restores of the same file.
+        Check ``expected_version`` under the content lock before writing.
         """
         await self._fs._ensure_access(uri, ctx, action=AclAction.WRITE)
         record = await self._managed(uri, ctx)
         path = self._path(ctx.account_id, record["id"], uri)
-        async with self._store.locked(path):
-            record = await self._store.get(ctx.account_id, record["id"])
-            if await self._running(ctx.account_id, record):
-                raise ConflictError("Compile is running", resource="COMPILE_RUNNING")
-            index = await self._store.read_json(path) or {"versions": []}
-            versions = {entry["version_id"]: entry for entry in index["versions"]}
-            current = index["versions"][-1]["version_id"] if index["versions"] else None
-            if current != expected_version:
-                raise ConflictError(
-                    f"Current version is {current}, not {expected_version}",
-                    resource="VERSION_CONFLICT",
-                )
-            source = versions.get(source_version)
-            if source is None:
-                raise NotFoundError(source_version, "file version")
-            content = await self._fs.show(
-                source["snapshot_id"], path=source["snapshot_path"], ctx=ctx
-            )
-            await write(content)
-            snapshot = await self._commit([uri], f"restore {uri} to {source_version}", ctx)
-        if not snapshot or not await self._changed(ctx.account_id, record["id"], uri, snapshot):
-            return {"uri": uri, "version_id": current, "restored_from": None, "result": "noop"}
-        version = await self.append(
-            ctx.account_id,
-            record["id"],
-            uri,
-            snapshot,
-            {
-                "source": "restore",
-                "actor": ctx.user.user_id,
-                "restored_from": source_version,
-                "provenance": dict(source.get("provenance") or {}),
-            },
-            source_roots=list(index.get("source_roots") or [uri]),
-        )
-        return {"uri": uri, "version_id": version["version_id"], "restored_from": source_version}
+        index = await self._store.read_json(path) or {"versions": []}
+        source = next((v for v in index["versions"] if v["version_id"] == source_version), None)
+        if source is None:
+            raise NotFoundError(source_version, "file version")
+        content = await self._fs.show(source["snapshot_id"], path=source["snapshot_path"], ctx=ctx)
+        result: Dict[str, Any] = {}
 
-    async def _commit(self, uris: List[str], message: str, ctx: RequestContext) -> Optional[str]:
+        async def commit_restore(uris, *, lease_ref, write):
+            """Check, write and version under the content lease before refresh."""
+            async with self._store.locked(path):
+                record = await self._store.get(ctx.account_id, target_id)
+                if await self._running(ctx.account_id, record):
+                    raise ConflictError("Compile is running", resource="COMPILE_RUNNING")
+                index = await self._store.read_json(path) or {"versions": []}
+                current = index["versions"][-1]["version_id"] if index["versions"] else None
+                if current != expected_version:
+                    raise ConflictError(
+                        f"Current version is {current}, not {expected_version}",
+                        resource="VERSION_CONFLICT",
+                    )
+                written = await write()
+                snapshot = await self._commit(
+                    uris, f"restore {uri} to {source_version}", ctx, lease_ref=lease_ref
+                )
+            if not snapshot or not await self._changed(ctx.account_id, target_id, uri, snapshot):
+                result.update(uri=uri, version_id=current, restored_from=None, result="noop")
+            else:
+                version = await self.append(
+                    ctx.account_id,
+                    target_id,
+                    uri,
+                    snapshot,
+                    {
+                        "source": "restore",
+                        "actor": ctx.user.user_id,
+                        "restored_from": source_version,
+                        "provenance": dict(source.get("provenance") or {}),
+                    },
+                    source_roots=list(index.get("source_roots") or [uri]),
+                )
+                result.update(
+                    uri=uri, version_id=version["version_id"], restored_from=source_version
+                )
+            return written
+
+        target_id = record["id"]
+        await write(content, commit_restore)
+        return result
+
+    async def _commit(
+        self,
+        uris: List[str],
+        message: str,
+        ctx: RequestContext,
+        *,
+        lease_ref: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         return await commit_snapshot(
-            self._fs, uris, message, task_ctx(ctx.account_id, ctx.user.user_id)
+            self._fs, uris, message, task_ctx(ctx.account_id, ctx.user.user_id), lease_ref=lease_ref
         )

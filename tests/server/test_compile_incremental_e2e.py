@@ -4,6 +4,7 @@ Runtime is not called: the test drives the provider hooks the queue worker would
 run, so it checks the kernel half (registry, snapshots, change plan, finish).
 """
 
+import asyncio
 from datetime import datetime
 
 import pytest
@@ -14,6 +15,7 @@ from openviking.service.compile_service import CompileRequest
 from openviking.service.compile_targets import parse_schedule
 from openviking.service.external_task_service import ExternalTaskSnapshot
 from openviking.service.task_tracker import get_task_tracker
+from openviking.storage.content_write import ContentWriteCoordinator
 from openviking_cli.session.user_id import UserIdentifier
 
 pytest.importorskip("ragfs_python")
@@ -86,8 +88,8 @@ async def test_incremental_compile_on_real_git(service):
 
 
 @pytest.mark.asyncio
-async def test_versions_candidates_edit_and_single_file_restore(service):
-    ctx = RequestContext(user=UserIdentifier("default", "test_user"), role=Role.ROOT)
+async def test_versions_candidates_edit_and_single_file_restore(service, monkeypatch):
+    ctx = RequestContext(user=UserIdentifier("default", "test_user"), role=Role.USER)
     page = f"{TO}/page.md"
     for uri, text in [(f"{SRC}/a.md", "a"), (f"{SKILL}/SKILL.md", "s")]:
         await _write(service, uri, text, ctx)
@@ -101,8 +103,29 @@ async def test_versions_candidates_edit_and_single_file_restore(service):
     _, changes = await _run(service, ctx, write_page="v2")
     assert changes["candidate_output_scopes"] == [{"uri": page, "recursive": False}]
 
+    expected = ("v3", "manual", b"edited")
+    observed = []
+    enqueue = ContentWriteCoordinator._enqueue_lock_coordinator
+
+    async def check_version_before_refresh(self, **kwargs):
+        """Refresh observes committed content and version."""
+        if kwargs["root_uri"] == page:
+            history = await service.compile.file_versions(page, ctx, limit=20, before=None)
+            latest = history["versions"][0]
+            assert (latest["version_id"], latest["source"]) == expected[:2]
+            body = await service.viking_fs.show(
+                latest["snapshot_id"], path=latest["snapshot_path"], ctx=ctx
+            )
+            assert body == expected[2]
+            observed.append(latest["source"])
+        return await enqueue(self, **kwargs)
+
+    monkeypatch.setattr(
+        ContentWriteCoordinator, "_enqueue_lock_coordinator", check_version_before_refresh
+    )
+
     # A console edit is a manual version and makes the file self-bound.
-    await service.fs.write(page, "edited", ctx, edit_source="manual")
+    await service.fs.write(page, "edited", ctx, edit_source="manual", wait=True)
     versions = await service.compile.file_versions(page, ctx, limit=20, before=None)
     assert [(v["version_id"], v["source"]) for v in versions["versions"]][:2] == [
         ("v3", "manual"),
@@ -115,11 +138,79 @@ async def test_versions_candidates_edit_and_single_file_restore(service):
     # Single-file restore writes v1 back as a new version; a stale expectation conflicts.
     from openviking_cli.exceptions import ConflictError
 
-    with pytest.raises(ConflictError):
+    with pytest.raises(ConflictError) as conflict:
         await service.compile.restore_file_version(page, "v1", "v2", ctx)
+    assert conflict.value.details["resource"] == "VERSION_CONFLICT"
+    assert await service.viking_fs.read_file(page, ctx=ctx) == "edited"
+    expected = ("v4", "restore", b"v1")
     restored = await service.compile.restore_file_version(page, "v1", "v3", ctx)
     assert restored == {"uri": page, "version_id": "v4", "restored_from": "v1"}
     assert (await service.viking_fs.read_file(page, ctx=ctx)).strip() == "v1"
+    await service.resources.wait_processed()
+
+    unchanged = await service.compile.restore_file_version(page, "v1", "v4", ctx)
+    assert unchanged == {"uri": page, "version_id": "v4", "restored_from": None, "result": "noop"}
+    await service.resources.wait_processed()
+    versions = await service.compile.file_versions(page, ctx, limit=20, before=None)
+    assert versions["current_version"] == "v4"
+    assert len(versions["versions"]) == 4
+    assert observed == ["manual", "restore"]
+
+
+@pytest.mark.asyncio
+async def test_writes_outside_compile_target_do_not_snapshot(service, monkeypatch):
+    ctx = RequestContext(user=UserIdentifier("default", "test_user"), role=Role.USER)
+    for uri, text in [(f"{SRC}/a.md", "a"), (f"{SKILL}/SKILL.md", "s")]:
+        await _write(service, uri, text, ctx)
+    await _run(service, ctx, write_page="v1")
+
+    async def unexpected_snapshot(*args, **kwargs):
+        pytest.fail("Only writes inside an initialized Compile target create versions")
+
+    monkeypatch.setattr(service.compile.lifecycle.versions, "_commit", unexpected_snapshot)
+    for uri in [f"{SRC}/a.md", f"{TO}_sibling/page.md"]:
+        await service.fs.write(uri, "outside target", ctx, wait=True)
+        assert await service.viking_fs.read_file(uri, ctx=ctx) == "outside target"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_restores_of_different_files_in_one_target(service):
+    ctx = RequestContext(user=UserIdentifier("default", "test_user"), role=Role.USER)
+    for uri, text in [(f"{SRC}/a.md", "a"), (f"{SKILL}/SKILL.md", "s")]:
+        await _write(service, uri, text, ctx)
+    await _run(service, ctx, write_page="untouched")
+    pages = [f"{TO}/concurrent-{index}.md" for index in range(5)]
+    for index, uri in enumerate(pages):
+        await service.fs.write(uri, f"old {index}", ctx, wait=True)
+        await service.fs.write(uri, f"new {index}", ctx, wait=True)
+
+    for source, expected, created, body in [
+        ("v1", "v2", "v3", "old"),
+        ("v2", "v3", "v4", "new"),
+    ]:
+        results = await asyncio.gather(
+            *(service.compile.restore_file_version(uri, source, expected, ctx) for uri in pages),
+            return_exceptions=True,
+        )
+        assert results == [
+            {"uri": uri, "version_id": created, "restored_from": source} for uri in pages
+        ]
+        await service.resources.wait_processed()
+        for index, uri in enumerate(pages):
+            content = f"{body} {index}"
+            assert await service.viking_fs.read_file(uri, ctx=ctx) == content
+            versions = await service.compile.file_versions(uri, ctx, limit=20, before=None)
+            assert len(versions["versions"]) == int(created[1:])
+            latest = versions["versions"][0]
+            assert (latest["version_id"], latest["source"]) == (created, "restore")
+            snapshot = await service.viking_fs.show(
+                latest["snapshot_id"], path=latest["snapshot_path"], ctx=ctx
+            )
+            assert snapshot == content.encode()
+
+    assert await service.viking_fs.read_file(f"{TO}/page.md", ctx=ctx) == "untouched"
+    untouched = await service.compile.file_versions(f"{TO}/page.md", ctx, limit=20, before=None)
+    assert untouched["current_version"] == "v1"
 
 
 @pytest.mark.asyncio

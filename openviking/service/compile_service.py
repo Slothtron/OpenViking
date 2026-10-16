@@ -667,10 +667,15 @@ class CompileService:
     async def restore_file_version(
         self, uri: str, source_version: str, expected_version: str, ctx: RequestContext
     ) -> dict[str, Any]:
-        async def write(content: bytes) -> None:
-            # Normal write path so summaries and indexes refresh; CompileVersions
-            # records this as a restore version instead of an edit.
-            await self._fs.write(uri, content.decode("utf-8"), ctx, record_version=False)
+        async def write(content: bytes, commit_content: Any) -> None:
+            # Use normal refresh while recording a restore version.
+            await self._fs.write(
+                uri,
+                content.decode("utf-8"),
+                ctx,
+                record_version=False,
+                commit_content=commit_content,
+            )
 
         return await self._require_lifecycle().versions.restore(
             uri, source_version, expected_version, ctx, write
