@@ -566,6 +566,7 @@ class OpenVikingService:
             viking_fs=self._viking_fs,
             session_compressor=self._session_compressor,
             vlm_resolver=self._vlm_resolver,
+            privacy_config_service=self._privacy_config_service,
         )
         self._resource_memory_link_service.set_dependencies(
             vikingdb=self._vikingdb_manager,

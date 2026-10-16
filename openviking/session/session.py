@@ -19,6 +19,8 @@ from openviking.core.namespace import canonical_session_uri
 from openviking.core.peer_id import normalize_peer_id, safe_peer_id
 from openviking.message import Message, Part
 from openviking.message.part import TextPart, ToolPart
+from openviking.privacy.service import UserPrivacyConfigService
+from openviking.privacy.session_extractor import extract_session_privacy_values
 from openviking.server.config import ToolOutputExternalizationConfig
 from openviking.server.identity import RequestContext, Role
 from openviking.session import working_memory as wm
@@ -47,6 +49,7 @@ from openviking.session.extraction_batch import (
 from openviking.session.memory.constants import AGENT_EVOLUTION_MEMORY_TYPES
 from openviking.session.memory.utils.language import resolve_output_language_from_conversation
 from openviking.session.memory_policy import MemoryPolicy
+from openviking.session.privacy_policy import PrivacyPolicy
 from openviking.session.retention import (
     RETENTION_MODE_TURN_BUDGET,
     RetentionPlan,
@@ -311,6 +314,8 @@ class SessionMeta:
     retained_message_token_budget: int = 0
     min_raw_tail_steps: int = 1
     memory_policy: Optional[Dict[str, Any]] = None
+    # Set only at creation. None uses the PrivacyPolicy defaults.
+    privacy_policy: Optional[Dict[str, Any]] = None
     # Automatic-commit policy. None keeps auto-commit disabled; a dict enables
     # it with the stored bounds. Session config PATCH may update it.
     auto_commit_policy: Optional[Dict[str, Any]] = None
@@ -345,6 +350,9 @@ class SessionMeta:
             "retained_message_token_budget": self.retained_message_token_budget,
             "min_raw_tail_steps": self.min_raw_tail_steps,
             "memory_policy": dict(self.memory_policy) if self.memory_policy is not None else None,
+            "privacy_policy": (
+                dict(self.privacy_policy) if self.privacy_policy is not None else None
+            ),
             "auto_commit_policy": (
                 dict(self.auto_commit_policy) if self.auto_commit_policy is not None else None
             ),
@@ -401,6 +409,7 @@ class SessionMeta:
             ),
             min_raw_tail_steps=max(0, int(data.get("min_raw_tail_steps", 1) or 0)),
             memory_policy=data.get("memory_policy"),
+            privacy_policy=data.get("privacy_policy"),
             auto_commit_policy=data.get("auto_commit_policy"),
             last_message_at=data.get("last_message_at", ""),
             last_auto_commit_at=data.get("last_auto_commit_at", ""),
@@ -427,6 +436,7 @@ class Session:
         agent_evolution_enabled_provider: Optional[Callable[[], bool | Awaitable[bool]]] = None,
         memory_policy_provider: Optional[MemoryPolicyProvider] = None,
         vlm_resolver: Optional["VLMResolver"] = None,
+        privacy_config_service: Optional[UserPrivacyConfigService] = None,
     ):
         self._viking_fs = viking_fs
         self._vikingdb_manager = vikingdb_manager
@@ -466,6 +476,7 @@ class Session:
         self._memory_policy_provider = memory_policy_provider
         self._usage_reporter = usage_reporter
         self._vlm_resolver = vlm_resolver
+        self._privacy_config_service = privacy_config_service
 
     async def _get_vlm_config(self):
         if self._vlm_resolver is None:
@@ -479,6 +490,21 @@ class Session:
         if policy is None and self._memory_policy_provider is not None:
             policy = await self._memory_policy_provider()
         return MemoryPolicy.from_dict(policy)
+
+    async def _resolve_privacy_policy(self) -> PrivacyPolicy:
+        """Return the creation-time policy even when this object was never loaded."""
+        if self._loaded or not self._viking_fs:
+            return PrivacyPolicy.from_dict(self._meta.privacy_policy)
+        try:
+            meta = json.loads(
+                await self._viking_fs.read_file(f"{self._session_uri}/.meta.json", ctx=self.ctx)
+            )
+        except Exception as exc:
+            if not _is_storage_not_found(exc):
+                raise
+            # Not created yet: the in-memory meta is what will be persisted.
+            return PrivacyPolicy.from_dict(self._meta.privacy_policy)
+        return PrivacyPolicy.from_dict(meta.get("privacy_policy"))
 
     async def load(self):
         """Load session data from storage."""
@@ -864,6 +890,23 @@ class Session:
         messages_spec: List[dict],
     ) -> List[Message]:
         """Asynchronously add multiple messages without blocking the caller loop."""
+        if self._privacy_config_service is not None:
+            policy = await self._resolve_privacy_policy()
+            if policy.extract_enabled:
+                messages_spec, values = await asyncio.to_thread(
+                    extract_session_privacy_values, self.session_id, messages_spec
+                )
+                # Persist values before externalization or append. A failed
+                # privacy write must reject the batch without storing raw content.
+                if values:
+                    await self._privacy_config_service.merge_values(
+                        self.ctx,
+                        "session",
+                        self.session_id,
+                        values,
+                        updated_by=self.ctx.user.user_id,
+                        change_reason="Session message extraction",
+                    )
         message_groups = self._build_message_groups(messages_spec)
         messages = []
         for group in message_groups:

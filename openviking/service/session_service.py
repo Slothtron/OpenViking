@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from openviking.core.namespace import canonical_session_uri
+from openviking.privacy.service import UserPrivacyConfigService
 from openviking.server.config import ToolOutputExternalizationConfig
 from openviking.server.identity import RequestContext
 from openviking.server.user_config import read_user_memory_policy
@@ -31,6 +32,7 @@ from openviking.session import Session
 from openviking.session.auto_commit_policy import AutoCommitPolicy
 from openviking.session.memory.memory_type_registry import get_default_registry
 from openviking.session.memory_policy import MemoryPolicy
+from openviking.session.privacy_policy import PrivacyPolicy
 from openviking.storage.viking_fs import VikingFS
 from openviking.storage.vikingdb_manager import VikingDBManager
 from openviking.utils.tags import normalize_search_tags
@@ -71,6 +73,7 @@ class SessionService:
         self._default_user_memory_policy: Optional[Dict[str, Any]] = None
         self._default_user_auto_commit_policy: Optional[Dict[str, Any]] = None
         self._usage_reporter: Optional["UsageReporter"] = None
+        self._privacy_config_service: Optional[UserPrivacyConfigService] = None
         # Server-wide controls remain disabled until configured during app setup.
         self._session_auto_commit_config = SessionAutoCommitConfig()
         # Per-worker in-flight guard so bursts don't spawn duplicate commit
@@ -86,12 +89,14 @@ class SessionService:
         viking_fs: VikingFS,
         session_compressor: "SessionCompressorV3",
         vlm_resolver: Optional["VLMResolver"] = None,
+        privacy_config_service: Optional[UserPrivacyConfigService] = None,
     ) -> None:
         """Set dependencies (for deferred initialization)."""
         self._vikingdb = vikingdb
         self._viking_fs = viking_fs
         self._session_compressor = session_compressor
         self._vlm_resolver = vlm_resolver
+        self._privacy_config_service = privacy_config_service
 
     def set_tool_output_externalization_config(
         self, config: ToolOutputExternalizationConfig
@@ -218,6 +223,7 @@ class SessionService:
             memory_policy_provider=lambda: self._get_user_memory_policy(ctx),
             usage_reporter=self._usage_reporter,
             vlm_resolver=self._vlm_resolver,
+            privacy_config_service=self._privacy_config_service,
         )
 
     async def _get_user_memory_policy(self, ctx: RequestContext) -> Optional[Dict[str, Any]]:
@@ -232,6 +238,7 @@ class SessionService:
         ctx: RequestContext,
         session_id: Optional[str] = None,
         memory_policy: Optional[Dict[str, Any]] = None,
+        privacy_policy: Optional[Dict[str, Any]] = None,
         auto_commit_policy: Optional[Dict[str, Any]] = None,
         update_auto_commit_policy: bool = False,
         event_tags: Optional[List[str]] = None,
@@ -243,6 +250,8 @@ class SessionService:
             session_id: Optional session ID. If provided, creates a session with the given ID.
                        If None, creates a new session with auto-generated ID.
             memory_policy: Optional default extraction policy for future commits.
+            privacy_policy: Optional credential extraction and read-restore
+                switches. Fixed at creation; ``None`` uses the defaults.
             auto_commit_policy: Optional automatic-commit policy overrides. Missing
                 fields fall back to the recommended defaults.
             event_tags: Optional default custom scalar tags for event memories
@@ -265,6 +274,8 @@ class SessionService:
                     set(get_default_registry().list_names(include_disabled=False))
                 )
                 session.meta.memory_policy = policy.to_dict()
+            if privacy_policy is not None:
+                session.meta.privacy_policy = PrivacyPolicy.from_dict(privacy_policy).to_dict()
             # Auto-commit is enabled when the caller supplies a policy, or when
             # the server default turns it on. Absent both, it stays disabled.
             if update_auto_commit_policy and auto_commit_policy is None:
@@ -489,6 +500,11 @@ class SessionService:
         )
         self._record_lifecycle_metric("extract", "ok")
         return memories
+
+    @staticmethod
+    def effective_privacy_policy(session: Session) -> Dict[str, Any]:
+        """Return the resolved privacy policy with defaults filled."""
+        return PrivacyPolicy.from_dict(session.meta.privacy_policy).to_dict()
 
     @staticmethod
     def effective_auto_commit_policy(session: Session) -> Optional[Dict[str, Any]]:
