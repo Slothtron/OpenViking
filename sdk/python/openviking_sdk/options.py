@@ -106,6 +106,8 @@ class BatchWriteOptions(_ExtraOptions, total=False):
     processing_mode: ProcessingMode
     # Return target-state conflicts without overwriting them or blocking compatible writes.
     skip_conflicts: bool
+    # Snapshot the root directory before scheduling semantic refreshes.
+    commit_folder: bool
 
 
 class CompileOptions(_ExtraOptions, total=False):

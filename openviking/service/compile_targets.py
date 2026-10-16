@@ -658,7 +658,12 @@ class CompileLifecycle:
             if run["target_base"] is None:
                 pass  # Never started: nothing to snapshot or roll back.
             elif snapshot.status == "completed":
-                head = await self._commit([request["to"]], f"compile {task.task_id} finish", ctx)
+                runtime_meta = snapshot.meta or {}
+                head = (
+                    runtime_meta["commit_oid"]
+                    if "commit_oid" in runtime_meta
+                    else await self._commit([request["to"]], f"compile {task.task_id} finish", ctx)
+                )
                 run["target_head"] = head
                 changes = (
                     await self._fs.diff_paths(
@@ -969,11 +974,13 @@ class CompileVersions:
         *,
         lease_ref: Optional[Dict[str, Any]] = None,
         write: Optional[Callable[[], Awaitable[Any]]] = None,
+        snapshot_id: Optional[str] = None,
     ) -> Any:
         """Write and version managed outputs before refresh, returning the write result.
 
         Active Compile records its own versions; other edits become self-bound.
         Batch URIs are already written and omit ``write``.
+        snapshot_id reuses a batch's directory snapshot for its file versions.
         """
         written = await write() if write is not None else None
         grouped: Dict[str, List[str]] = {}
@@ -987,7 +994,9 @@ class CompileVersions:
                 continue
             grouped.setdefault(record["id"], []).append(uri)
         for target_id, targets in grouped.items():
-            snapshot = await self._commit(targets, f"{edit_source} edit", ctx, lease_ref=lease_ref)
+            snapshot = snapshot_id or await self._commit(
+                targets, f"{edit_source} edit", ctx, lease_ref=lease_ref
+            )
             for uri in targets:
                 if snapshot and await self._changed(ctx.account_id, target_id, uri, snapshot):
                     await self.append(

@@ -662,13 +662,14 @@ class VikingClient:
         operations: List[Dict[str, Any]],
         wait: bool = True,
         skip_conflicts: bool = False,
+        commit_folder: bool = False,
     ) -> Dict[str, Any]:
         """Publish a bundle, optionally retaining conflicting targets and reporting their URIs."""
         return await self.client.batch_write(
             root_uri=root_uri,
             operations=operations,
             wait=wait,
-            options={"skip_conflicts": skip_conflicts},
+            options={"skip_conflicts": skip_conflicts, "commit_folder": commit_folder},
         )
 
     async def read_content(

@@ -4832,10 +4832,7 @@ mod tests {
         );
     }
 
-    // Regression: a path the restore diff wants to delete may already be absent
-    // from the VFS (e.g. a derived file like `.abstract.md` removed out of
-    // band). The delete must be idempotent — restore should succeed and advance
-    // the branch ref rather than aborting with a `vfs: not found` error.
+    // Restore deletion is idempotent when a tracked file is already absent.
     #[tokio::test]
     async fn test_restore_tolerates_already_deleted_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -4848,12 +4845,11 @@ mod tests {
             ref_store.clone() as Arc<dyn RefStore>,
         );
 
-        // Source commit: a.md plus a derived file the diff will later delete.
+        // The source excludes the file that HEAD adds.
         vfs.put("resources/proj_a/a.md", b"A v1");
         let source_oid = make_commit(&svc, "acct", "main", "source").await;
 
-        // HEAD adds the derived file, so restoring source wants to delete it.
-        vfs.put("resources/proj_a/.abstract.md", b"derived");
+        vfs.put("resources/proj_a/obsolete.md", b"obsolete");
         vfs.put("resources/proj_a/a.md", b"A v2");
         let head_oid = match svc
             .commit(req(
@@ -4862,7 +4858,7 @@ mod tests {
                 "head",
                 Some(vec![
                     "resources/proj_a/a.md".to_string(),
-                    "resources/proj_a/.abstract.md".to_string(),
+                    "resources/proj_a/obsolete.md".to_string(),
                 ]),
             ))
             .await
@@ -4872,9 +4868,7 @@ mod tests {
             other => panic!("expected Created, got {other:?}"),
         };
 
-        // Simulate the derived file vanishing from the VFS out of band, so the
-        // restore's delete step hits a missing path.
-        vfs.delete("resources/proj_a/.abstract.md");
+        vfs.delete("resources/proj_a/obsolete.md");
 
         let resp = svc
             .restore(RestoreRequest {
@@ -4899,7 +4893,7 @@ mod tests {
             } => {
                 // The diff still *plans* the delete (count is unchanged); the
                 // VFS apply just no-ops on the missing path.
-                assert_eq!(deleted, 1, ".abstract.md");
+                assert_eq!(deleted, 1, "obsolete.md");
                 assert_eq!(deleted_paths.len(), 1);
                 new_commit_oid
             }

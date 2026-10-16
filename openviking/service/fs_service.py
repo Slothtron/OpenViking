@@ -1316,6 +1316,7 @@ class FSService:
         ctx: RequestContext,
         wait: bool = True,
         skip_conflicts: bool = False,
+        commit_folder: bool = False,
         processing_mode: str = "semantic_and_vectors",
     ) -> Dict[str, Any]:
         """Apply multiple file writes and aggregate downstream refresh."""
@@ -1336,6 +1337,7 @@ class FSService:
             ctx=ctx,
             wait=wait,
             skip_conflicts=skip_conflicts,
+            commit_folder=commit_folder,
             processing_mode=processing_mode,
         )
         return result

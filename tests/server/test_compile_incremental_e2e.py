@@ -6,16 +6,18 @@ run, so it checks the kernel half (registry, snapshots, change plan, finish).
 
 import asyncio
 from datetime import datetime
+from unittest.mock import AsyncMock
 
 import pytest
 
 from openviking.server.identity import RequestContext, Role
 from openviking.service.compile_scheduler import TZ, current_slot, next_slot
-from openviking.service.compile_service import CompileRequest
+from openviking.service.compile_service import CompileRequest, CompileSessionStatus
 from openviking.service.compile_targets import parse_schedule
 from openviking.service.external_task_service import ExternalTaskSnapshot
 from openviking.service.task_tracker import get_task_tracker
 from openviking.storage.content_write import ContentWriteCoordinator
+from openviking.storage.queuefs import get_queue_manager
 from openviking_cli.session.user_id import UserIdentifier
 
 pytest.importorskip("ragfs_python")
@@ -85,6 +87,51 @@ async def test_incremental_compile_on_real_git(service):
     assert config["initialized"] is True and config["last_run"]["status"] == "completed"
     runs = await service.compile.list_runs(TO, ctx, limit=10, cursor=None)
     assert [run["result"] for run in runs["runs"] if run["result"]][0]["updated"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("git_enabled", [True, False])
+async def test_finish_reuses_runtime_snapshot(service, monkeypatch, git_enabled):
+    ctx = RequestContext(user=UserIdentifier("default", "test_user"), role=Role.USER)
+    for uri, text in [(f"{SRC}/a.md", "a"), (f"{SKILL}/SKILL.md", "s")]:
+        await _write(service, uri, text, ctx)
+    compile_service = service.compile
+    compile_service.configure_local_backend("http://127.0.0.1:1", "")
+    request = CompileRequest.model_validate({"from": [SRC], "to": TO, "skill": SKILL})
+    task = await compile_service.create(request, connection={}, ctx=ctx)
+    queue = get_queue_manager().get_queue("ExternalTask")
+    delivery = await queue.dequeue_raw()
+    task = await get_task_tracker().get(task.task_id, ctx.account_id, ctx.user.user_id)
+    await compile_service.on_start(task)
+    await _write(service, f"{TO}/page.md", "published", ctx)
+    head = await compile_service.lifecycle._commit([TO], "publish", ctx)
+    await _write(service, f"{TO}/page.md", "later write", ctx)
+    await compile_service.lifecycle._commit([TO], "later write", ctx)
+
+    async def unexpected_commit(*args, **kwargs):
+        pytest.fail("Finish must reuse the published snapshot, including disabled Git")
+
+    monkeypatch.setattr(compile_service.lifecycle, "_commit", unexpected_commit)
+    snapshot = compile_service._snapshot(
+        CompileSessionStatus(
+            status="completed",
+            stage="completed",
+            meta={"commit_oid": head if git_enabled else None},
+        )
+    )
+    identity = {"account_id": ctx.account_id, "user_id": ctx.user.user_id}
+    await get_task_tracker().start(task.task_id, **identity)
+    assert await compile_service._tasks._apply_snapshot(snapshot, task_id=task.task_id, **identity)
+    await queue.ack(delivery["id"], delivery)
+    assert (await get_task_tracker().get(task.task_id, **identity)).status == "completed"
+    run = await compile_service.lifecycle.store.get_run(
+        ctx.account_id, task.meta["request"]["compile"]["target_id"], task.task_id
+    )
+    assert run["target_head"] == (head if git_enabled else None)
+    assert run["status"] == "completed"
+    if git_enabled:
+        versions = await compile_service.file_versions(f"{TO}/page.md", ctx, limit=5, before=None)
+        assert versions["versions"][0]["snapshot_id"] == head
 
 
 @pytest.mark.asyncio
@@ -171,6 +218,91 @@ async def test_writes_outside_compile_target_do_not_snapshot(service, monkeypatc
     for uri in [f"{SRC}/a.md", f"{TO}_sibling/page.md"]:
         await service.fs.write(uri, "outside target", ctx, wait=True)
         assert await service.viking_fs.read_file(uri, ctx=ctx) == "outside target"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_folder_batches_snapshot_before_refresh(service, monkeypatch):
+    from openviking.pyagfs.exceptions import AGFSNotFoundError
+
+    ctx = RequestContext(user=UserIdentifier("default", "test_user"), role=Role.USER)
+    for uri, text in [(f"{SRC}/a.md", "a"), (f"{SKILL}/SKILL.md", "s")]:
+        await _write(service, uri, text, ctx)
+    await _run(service, ctx, write_page="unchanged")
+    sidecars = [
+        f"{TO}/{name}"
+        for name in (".abstract.md", ".overview.md", "page.md.abstract.md", "page.md.overview.md")
+    ]
+    for uri in sidecars:
+        await _write(service, uri, "derived", ctx)
+    snapshots = {}
+    vfs = service.viking_fs
+    commit = vfs.commit
+    enqueue = ContentWriteCoordinator._enqueue_lock_coordinator
+
+    async def capture_snapshot(**kwargs):
+        result = await commit(**kwargs)
+        snapshots.setdefault(asyncio.current_task(), []).append(result["commit_oid"])
+        return result
+
+    async def check_before_refresh(self, **kwargs):
+        oid = snapshots[asyncio.current_task()][0]
+        covered = kwargs["lock_handoff"]["covered_paths"]
+        assert len(covered) == 1 and covered[0]["kind"] == "exact"
+        uri = vfs._path_to_uri(covered[0]["path"], ctx=ctx)
+        history = await service.compile.file_versions(uri, ctx, limit=5, before=None)
+        assert history["versions"][0]["snapshot_id"] == oid
+        assert await vfs.show(oid, path=uri, ctx=ctx) == b"published"
+        for sidecar in sidecars:
+            with pytest.raises(AGFSNotFoundError):
+                await vfs.show(oid, path=sidecar, ctx=ctx)
+        return await enqueue(self, **kwargs)
+
+    monkeypatch.setattr(vfs, "commit", capture_snapshot)
+    monkeypatch.setattr(ContentWriteCoordinator, "_enqueue_lock_coordinator", check_before_refresh)
+    pages = [f"{TO}/{name}.md" for name in ("a", "b")]
+    batches = [
+        service.fs.batch_write(
+            root_uri=TO,
+            operations=[{"uri": uri, "content": "published", "mode": "upsert"}],
+            ctx=ctx,
+            wait=True,
+            commit_folder=True,
+        )
+        for uri in pages
+    ]
+    results = await asyncio.wait_for(asyncio.gather(*batches), timeout=30)
+    assert len(snapshots) == 2 and all(len(oids) == 1 for oids in snapshots.values())
+    for uri, result in zip(pages, results, strict=True):
+        assert [result["commit_oid"]] in snapshots.values()
+        assert await vfs.show(result["commit_oid"], path=uri, ctx=ctx) == b"published"
+    await service.resources.wait_processed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("git_disabled", [False, True])
+async def test_folder_snapshot_error_releases_locks(service, monkeypatch, git_disabled):
+    from openviking.pyagfs.exceptions import AGFSNotSupportedError
+
+    ctx = RequestContext(user=UserIdentifier("default", "test_user"), role=Role.USER)
+    page = f"{TO}/page.md"
+    await _write(service, page, "before", ctx)
+    error = AGFSNotSupportedError("disabled") if git_disabled else OSError("snapshot failed")
+    monkeypatch.setattr(service.viking_fs, "commit", AsyncMock(side_effect=error))
+    batch = service.fs.batch_write(
+        root_uri=TO,
+        operations=[{"uri": page, "content": "after", "mode": "upsert"}],
+        ctx=ctx,
+        commit_folder=True,
+    )
+    if git_disabled:
+        assert (await batch)["commit_oid"] is None
+    else:
+        enqueue = AsyncMock()
+        monkeypatch.setattr(ContentWriteCoordinator, "_enqueue_lock_coordinator", enqueue)
+        with pytest.raises(OSError, match="snapshot failed"):
+            await batch
+        enqueue.assert_not_awaited()
+    await _write(service, page, "lease released", ctx)
 
 
 @pytest.mark.asyncio
