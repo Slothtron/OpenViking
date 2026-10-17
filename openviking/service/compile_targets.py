@@ -566,7 +566,10 @@ class CompileLifecycle:
             record["active_task_id"] = task.task_id
         run = await self._store.get_run(account_id, target_id, task.task_id)
         if run is None or run["status"] == "queued":
-            run = await self._begin_run(task, record, run)
+            try:
+                run = await self._begin_run(task, record, run)
+            except ResourceBusyError:
+                return "busy"
         if run["status"] in TERMINAL:
             # Planned as a no-op, or finished before a crash: finalize without Runtime.
             return ExternalTaskSnapshot(status=run["status"], result=run.get("result") or {})
@@ -583,7 +586,9 @@ class CompileLifecycle:
         run["status"] = "running"
         run["started_at"] = time.time()
         paths = [request["to"], *(request["from"] if incremental else [])]
-        run["target_base"] = await self._commit(paths, f"compile {task.task_id} start", ctx)
+        run["target_base"] = await commit_snapshot(
+            self._fs, paths, f"compile {task.task_id} start", ctx, wait_busy=False
+        )
         await self.versions.record_external(task.account_id, record, run["target_base"])
         if incremental:
             run.update(await self._plan(record, request["from"], run["target_base"], ctx))
@@ -757,11 +762,12 @@ async def commit_snapshot(
     ctx: RequestContext,
     *,
     lease_ref: Optional[Dict[str, Any]] = None,
+    wait_busy: bool = True,
 ) -> Optional[str]:
     """Return the snapshot oid, or None when Git is disabled (Compile then runs in full).
 
-    A just-written file stays locked while its semantic refresh runs, so a busy
-    path is retried until ``SNAPSHOT_BUSY_SECONDS`` elapse.
+    Busy paths wait up to ``SNAPSHOT_BUSY_SECONDS`` unless ``wait_busy=False``
+    lets the caller defer work through its queue.
     """
     deadline = time.monotonic() + SNAPSHOT_BUSY_SECONDS
     kwargs = {"lease_ref": lease_ref} if lease_ref is not None else {}
@@ -774,7 +780,7 @@ async def commit_snapshot(
         except AGFSNotSupportedError:
             return None
         except ResourceBusyError:
-            if time.monotonic() >= deadline:
+            if not wait_busy or time.monotonic() >= deadline:
                 raise
             await asyncio.sleep(0.2)
     oid = result.get("commit_oid")

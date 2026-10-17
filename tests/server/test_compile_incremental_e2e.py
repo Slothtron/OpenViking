@@ -90,6 +90,45 @@ async def test_incremental_compile_on_real_git(service):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("locked_uri", [f"{SRC}/a.md", f"{TO}/page.md"])
+async def test_busy_start_requeues_until_path_unlocks(service, monkeypatch, locked_uri):
+    """Source or target file locks defer the same task without submitting Runtime work."""
+    ctx = RequestContext(user=UserIdentifier("default", "test_user"), role=Role.USER)
+    for uri in (f"{SRC}/a.md", f"{TO}/page.md", f"{SKILL}/SKILL.md"):
+        await _write(service, uri, "content", ctx)
+    compile_service = service.compile
+    compile_service.configure_local_backend("http://127.0.0.1:1", "")
+    submit = AsyncMock(return_value="runtime-id")
+    monkeypatch.setattr(compile_service, "submit", submit)
+    monkeypatch.setattr(
+        compile_service, "get", AsyncMock(return_value=ExternalTaskSnapshot(status="completed"))
+    )
+    task = await compile_service.create(
+        CompileRequest.model_validate({"from": [SRC], "to": TO, "skill": SKILL}),
+        connection={},
+        ctx=ctx,
+    )
+    queue = get_queue_manager().get_queue("ExternalTask")
+    tracker = get_task_tracker()
+    agfs = service.viking_fs._async_agfs
+    lease = await agfs.pathlock_acquire_exact(service.viking_fs._uri_to_path(locked_uri, ctx=ctx))
+    try:
+        for _ in range(2):
+            await asyncio.wait_for(queue.dequeue(), timeout=2)
+            current = await tracker.get(task.task_id, ctx.account_id, ctx.user.user_id)
+            assert current.status == "pending" and current.error is None
+            status = await queue.get_status()
+            assert (status.pending, status.in_progress, status.requeue_count) == (1, 0, _ + 1)
+            submit.assert_not_awaited()
+    finally:
+        await agfs.pathlock_release(lease)
+    await queue.dequeue()
+    assert (await tracker.get(task.task_id, ctx.account_id, ctx.user.user_id)).status == "completed"
+    submit.assert_awaited_once()
+    assert (await queue.get_status()).is_complete
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("git_enabled", [True, False])
 async def test_finish_reuses_runtime_snapshot(service, monkeypatch, git_enabled):
     ctx = RequestContext(user=UserIdentifier("default", "test_user"), role=Role.USER)
