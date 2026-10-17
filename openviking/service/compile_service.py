@@ -640,6 +640,7 @@ class CompileService:
                     "status",
                     "started_at",
                     "finished_at",
+                    "reindex_task_id",
                     "params",
                     "base",
                     "head",

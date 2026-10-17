@@ -147,6 +147,45 @@ def _coordinator_queue_for_unit_tests(monkeypatch, request):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        None,
+        {"tags": ["team=search"]},
+        {"tag_mode": "clear"},
+        {"acl": {"acl_mode": "restricted", "entries": []}},
+    ],
+)
+async def test_deferred_batch_only_writes_and_releases(monkeypatch, metadata):
+    root = "viking://resources/wiki"
+    vfs = _VFS(root)
+    monkeypatch.setattr(vfs, "prepare_acl_update", AsyncMock(return_value=object()), raising=False)
+    coordinator = ContentWriteCoordinator(
+        vfs, commit_content=AsyncMock(side_effect=AssertionError("commit"))
+    )
+    coordinator._refresh_batch = AsyncMock(side_effect=AssertionError("refresh"))
+    coordinator._prepare_batch_resource_plans = AsyncMock(side_effect=AssertionError("plan"))
+    coordinator._load_file_abstracts = AsyncMock(side_effect=AssertionError("index read"))
+    operation = {"uri": f"{root}/a.md", "content": "saved", **(metadata or {})}
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+    if metadata:
+        with pytest.raises(InvalidArgumentError, match="does not support tags or ACL"):
+            await coordinator.batch_write(
+                root_uri=root, operations=[operation], ctx=ctx, defer_processing=True
+            )
+        assert not vfs.writes
+    else:
+        result = await coordinator.batch_write(
+            root_uri=root, operations=[operation], ctx=ctx, defer_processing=True
+        )
+        assert vfs.files[operation["uri"]] == "saved"
+        assert result["semantic_status"] == result["vector_status"] == "deferred"
+        assert "commit_oid" not in result
+        assert vfs._async_agfs.releases == 1 and vfs._async_agfs.handoffs == 0
+    assert not vfs._async_agfs.held
+
+
+@pytest.mark.asyncio
 async def test_batch_accepts_more_than_256_operations(monkeypatch):
     root = "viking://resources/wiki"
     vfs = _VFS(root)
@@ -193,7 +232,9 @@ async def test_batch_create_replace_and_upsert_overwrite_or_create(monkeypatch):
     created_by_replace = f"{root}/replace.md"
     created_by_upsert = f"{root}/upsert.md"
     vfs = _VFS(root, {existing: "newer"})
-    coordinator = ContentWriteCoordinator(vfs)
+    coordinator = ContentWriteCoordinator(
+        vfs, commit_content=AsyncMock(side_effect=AssertionError("batch must not commit"))
+    )
 
     async def refresh(**kwargs):
         del kwargs

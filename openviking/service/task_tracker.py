@@ -428,17 +428,27 @@ class TaskTracker:
         *,
         account_id: str,
         user_id: str,
+        task_id: Optional[str] = None,
     ) -> Optional[TaskRecord]:
+        """Create an operation atomically, or return None while another is active.
+
+        An explicit task_id replays the same operation; a task with a different
+        type or resource raises ValueError. Owner validation belongs to create.
+        """
         try:
-            return await self.create(
+            task = await self.create(
                 task_type,
                 resource_id,
                 account_id=account_id,
                 user_id=user_id,
+                task_id=task_id,
                 reject_if_active=True,
             )
         except TaskAlreadyActive:
             return None
+        if task.task_type != task_type or task.resource_id != resource_id:
+            raise ValueError("Task ID belongs to another operation")
+        return task
 
     async def start(
         self,

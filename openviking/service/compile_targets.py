@@ -402,6 +402,8 @@ def new_run(task_id: str, trigger: str, params: Dict[str, Any], status: str) -> 
         "params": params,
         "target_base": None,
         "target_head": None,
+        "snapshot_committed": False,  # Also records Git-disabled finalization.
+        "reindex_task_id": None,
         "base": None,
         "head": None,
         "changed_roots": [],
@@ -570,9 +572,12 @@ class CompileLifecycle:
                 run = await self._begin_run(task, record, run)
             except ResourceBusyError:
                 return "busy"
-        if run["status"] in TERMINAL:
-            # Planned as a no-op, or finished before a crash: finalize without Runtime.
-            return ExternalTaskSnapshot(status=run["status"], result=run.get("result") or {})
+        if run["status"] in TERMINAL or run["status"] == "committing":
+            # Committing runs resume locally without querying the Runtime session.
+            return ExternalTaskSnapshot(
+                status="completed" if run["status"] == "committing" else run["status"],
+                result=run.get("result") or {},
+            )
         return "proceed"
 
     async def _begin_run(
@@ -652,47 +657,84 @@ class CompileLifecycle:
         }
 
     async def on_finish(self, task: Any, snapshot: ExternalTaskSnapshot) -> ExternalTaskSnapshot:
-        """Snapshot or roll back ``to``, slim the run, then advance progress and release."""
+        """Commit successful output and accept reindex before completing the run.
+
+        Saved snapshot and reindex identities allow interrupted finalization to
+        resume without publishing a second output version or reindex request.
+        """
         meta, request = task.meta["request"].get("compile"), task.meta["request"]
         if meta is None:
             return snapshot
         account_id, target_id = task.account_id, meta["target_id"]
-        run = await self._store.get_run(account_id, target_id, task.task_id)
-        if run is not None and run["finished_at"] is None:
-            ctx = task_ctx(task.account_id, task.user_id)
-            if run["target_base"] is None:
-                pass  # Never started: nothing to snapshot or roll back.
-            elif snapshot.status == "completed":
-                runtime_meta = snapshot.meta or {}
-                head = (
-                    runtime_meta["commit_oid"]
-                    if "commit_oid" in runtime_meta
-                    else await self._commit([request["to"]], f"compile {task.task_id} finish", ctx)
-                )
-                run["target_head"] = head
-                changes = (
-                    await self._fs.diff_paths(
-                        dirs=[request["to"]], base=run["target_base"], head=head, ctx=ctx
+        async with self._store.locked(
+            self._store._run_path(account_id, target_id, task.task_id) + ".finish"
+        ):
+            run = await self._store.get_run(account_id, target_id, task.task_id)
+            if run is not None and run["finished_at"] is None:
+                ctx = task_ctx(task.account_id, task.user_id)
+                if run["started_at"] is None or run["status"] == "completed":
+                    pass  # Unstarted and unchanged runs have no output to publish.
+                elif snapshot.status == "completed":
+                    from openviking.server.dependencies import get_service
+                    from openviking.service.reindex_executor import REINDEX_ENQUEUE_ERROR
+                    from openviking.service.task_tracker import get_task_tracker
+
+                    if run["status"] != "committing":
+                        run["status"] = "committing"
+                        await self._store.put_run(account_id, target_id, run)
+                    if not run.get("snapshot_committed"):
+                        run["target_head"] = await self._commit(
+                            [request["to"]], f"compile {task.task_id} finish", ctx
+                        )
+                        run["snapshot_committed"] = True
+                        await self._store.put_run(account_id, target_id, run)
+                    head = run["target_head"]
+                    changes = (
+                        await self._fs.diff_paths(
+                            dirs=[request["to"]], base=run["target_base"], head=head, ctx=ctx
+                        )
+                        if head and run["target_base"]
+                        else []
                     )
-                    if head
-                    else []
-                )
-                run["result"] = dict.fromkeys(_RESULT_KEYS.values(), 0)
-                for change in changes:
-                    run["result"][_RESULT_KEYS[change["change_type"]]] += 1
-                record = await self._store.get(account_id, target_id)
-                await self.versions.record_compile(account_id, record, run, head, changes)
-            else:
-                await self._rollback(request["to"], run, ctx)
-                run["error"] = snapshot.error_message or snapshot.status
-            run["status"] = snapshot.status
-            run["finished_at"] = time.time()
-            for large in ("scopes", "candidate_output_scopes"):
-                (run.get("changes") or {}).pop(large, None)
-            await self._store.put_run(account_id, target_id, run)
-        await self._release(account_id, target_id, task.task_id, run)
-        await self._store.prune_runs(account_id, target_id)
-        return snapshot
+                    run["result"] = dict.fromkeys(_RESULT_KEYS.values(), 0)
+                    for change in changes:
+                        run["result"][_RESULT_KEYS[change["change_type"]]] += 1
+                    record = await self._store.get(account_id, target_id)
+                    await self.versions.record_compile(account_id, record, run, head, changes)
+                    reindex_id = run.get("reindex_task_id")
+                    previous = (
+                        await get_task_tracker().get(
+                            reindex_id, account_id=account_id, user_id=task.user_id
+                        )
+                        if reindex_id
+                        else None
+                    )
+                    if reindex_id is None or (
+                        previous is not None and previous.error == REINDEX_ENQUEUE_ERROR
+                    ):
+                        run["reindex_task_id"] = str(uuid4())
+                        await self._store.put_run(account_id, target_id, run)
+                    await get_service().reindex(
+                        uri=request["to"],
+                        mode="semantic_and_vectors",
+                        force=False,
+                        recursive=True,
+                        wait=False,
+                        ctx=ctx,
+                        task_id=run["reindex_task_id"],
+                    )
+                else:
+                    if run["target_base"]:
+                        await self._rollback(request["to"], run, ctx)
+                    run["error"] = snapshot.error_message or snapshot.status
+                run["status"] = snapshot.status
+                run["finished_at"] = time.time()
+                for large in ("scopes", "candidate_output_scopes"):
+                    (run.get("changes") or {}).pop(large, None)
+                await self._store.put_run(account_id, target_id, run)
+            await self._release(account_id, target_id, task.task_id, run)
+            await self._store.prune_runs(account_id, target_id)
+            return snapshot
 
     async def _release(
         self, account_id: str, target_id: str, task_id: str, run: Optional[Dict[str, Any]]
@@ -915,6 +957,8 @@ class CompileVersions:
                 await self._store.remove(self._path(account_id, record["id"], uri))
                 continue
             index = await self.load(account_id, record["id"], uri)
+            if index and any(v.get("task_id") == run["task_id"] for v in index["versions"]):
+                continue
             if full or index is None:
                 roots = list(run["params"]["from"])
             else:
@@ -980,13 +1024,10 @@ class CompileVersions:
         *,
         lease_ref: Optional[Dict[str, Any]] = None,
         write: Optional[Callable[[], Awaitable[Any]]] = None,
-        snapshot_id: Optional[str] = None,
     ) -> Any:
         """Write and version managed outputs before refresh, returning the write result.
 
         Active Compile records its own versions; other edits become self-bound.
-        Batch URIs are already written and omit ``write``.
-        snapshot_id reuses a batch's directory snapshot for its file versions.
         """
         written = await write() if write is not None else None
         grouped: Dict[str, List[str]] = {}
@@ -1000,9 +1041,7 @@ class CompileVersions:
                 continue
             grouped.setdefault(record["id"], []).append(uri)
         for target_id, targets in grouped.items():
-            snapshot = snapshot_id or await self._commit(
-                targets, f"{edit_source} edit", ctx, lease_ref=lease_ref
-            )
+            snapshot = await self._commit(targets, f"{edit_source} edit", ctx, lease_ref=lease_ref)
             for uri in targets:
                 if snapshot and await self._changed(ctx.account_id, target_id, uri, snapshot):
                     await self.append(

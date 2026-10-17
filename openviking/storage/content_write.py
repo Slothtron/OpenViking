@@ -216,17 +216,11 @@ class ContentWriteCoordinator:
         self._privacy_sanitizer = privacy_sanitizer
         self._content_commit = commit_content
 
-    async def _commit_content(
-        self, uris: list[str], lease: Any, write=None, *, snapshot_id: str | None = None
-    ) -> Any:
-        """Write bytes and managed versions under the lease before refresh.
-
-        Return ``write()``'s result; batches omit it because bytes are already written.
-        """
+    async def _commit_content(self, uris: list[str], lease: Any, write) -> Any:
+        """Write bytes and managed versions under the lease before refresh."""
         if self._content_commit is not None:
-            kwargs = {"snapshot_id": snapshot_id} if snapshot_id is not None else {}
-            return await self._content_commit(uris, lease_ref=lease, write=write, **kwargs)
-        return await write() if write is not None else None
+            return await self._content_commit(uris, lease_ref=lease, write=write)
+        return await write()
 
     async def _sanitize_text(
         self,
@@ -393,7 +387,7 @@ class ContentWriteCoordinator:
         ctx: RequestContext,
         wait: bool = True,
         skip_conflicts: bool = False,
-        commit_folder: bool = False,
+        defer_processing: bool = False,
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
     ) -> Dict[str, Any]:
         return_terminal_result = wait and get_task_context() is None
@@ -409,7 +403,7 @@ class ContentWriteCoordinator:
                 ctx=ctx,
                 wait=wait,
                 skip_conflicts=skip_conflicts,
-                commit_folder=commit_folder,
+                defer_processing=defer_processing,
                 processing_mode=processing_mode,
                 wait_for_queues=wait_for_queues,
             )
@@ -436,23 +430,19 @@ class ContentWriteCoordinator:
         ctx: RequestContext,
         wait: bool = True,
         skip_conflicts: bool = False,
-        commit_folder: bool = False,
+        defer_processing: bool = False,
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
         wait_for_queues: bool = True,
     ) -> Dict[str, Any]:
-        """Write a bundle, optionally snapshot root_uri, then enqueue shared refresh.
+        """Write validated files under locks, optionally deferring all index work.
 
         Each operation follows the same create/replace/append semantics as ``write``;
         ``upsert`` is available for callers that already hold the desired final tree.
-        All target files stay locked from state validation through the last write,
-        while unrelated files remain writable. Locks are released after refresh completes.
-        commit_folder protects the directory until its snapshot is saved;
-        refresh retains only the file locks. The result includes commit_oid (None without Git).
-        Derived summaries are generated once per batch. Operation count and content size have
-        no application-level quotas; all operations undergo access and path validation.
-        With skip_conflicts, changed, missing or occupied targets are returned in
-        conflicts and left untouched; compatible files still commit under the same locks.
-        Permission, transport and write failures remain errors, not skipped conflicts.
+        Target files stay locked through refresh while unrelated files remain writable.
+        Deferred batches reject index-dependent metadata and release their locks
+        before returning. Partial I/O failures preserve earlier successful writes.
+        skip_conflicts leaves conflicting targets untouched; permission, transport
+        and write failures remain errors.
         """
         normalized_root = self._validate_uri_path(root_uri, field_name="root_uri")
         processing_mode = normalize_processing_mode(processing_mode)
@@ -460,6 +450,10 @@ class ContentWriteCoordinator:
         normalized_operations = await self._normalize_batch_operations(
             normalized_root, operations, ctx=ctx
         )
+        if defer_processing and any(
+            operation["ingest_options"] != IngestOptions() for operation in normalized_operations
+        ):
+            raise InvalidArgumentError("defer_processing does not support tags or ACL updates")
         await self._sanitize_batch_operations(normalized_operations, ctx=ctx)
 
         target_paths = [
@@ -467,18 +461,7 @@ class ContentWriteCoordinator:
             for operation in normalized_operations
         ]
         try:
-            if commit_folder:
-                from openviking.service.compile_targets import (
-                    SNAPSHOT_BUSY_SECONDS,
-                    commit_snapshot,
-                )
-
-                lease = await self._viking_fs._async_agfs.pathlock_acquire_tree(
-                    self._viking_fs._uri_to_path(normalized_root, ctx=ctx),
-                    timeout_secs=SNAPSHOT_BUSY_SECONDS,
-                )
-            else:
-                lease = await self._viking_fs._async_agfs.pathlock_acquire_exact_batch(target_paths)
+            lease = await self._viking_fs._async_agfs.pathlock_acquire_exact_batch(target_paths)
         except LockAcquisitionError as exc:
             raise ResourceBusyError(
                 f"resource is busy and cannot be written now: {normalized_root}",
@@ -545,24 +528,24 @@ class ContentWriteCoordinator:
                     continue
                 pending.append((operation, exists, write_mode))
 
-            prepared_resources = await self._prepare_batch_resource_plans(
-                pending=pending,
-                ctx=ctx,
-                lease=lease,
-                processing_mode=processing_mode,
-            )
-            file_abstracts = await self._load_file_abstracts(
-                [
-                    operation["uri"]
-                    for operation, existed, _ in pending
-                    if existed
-                    and context_type_for_uri(operation["uri"]) in {"resource", "skill"}
-                    and not is_abstract_overview_uri(operation["uri"])
-                    and operation["uri"] not in prepared_resources
-                ],
-                ctx=ctx,
-            )
-
+            if not defer_processing:
+                prepared_resources = await self._prepare_batch_resource_plans(
+                    pending=pending,
+                    ctx=ctx,
+                    lease=lease,
+                    processing_mode=processing_mode,
+                )
+                file_abstracts = await self._load_file_abstracts(
+                    [
+                        operation["uri"]
+                        for operation, existed, _ in pending
+                        if existed
+                        and context_type_for_uri(operation["uri"]) in {"resource", "skill"}
+                        and not is_abstract_overview_uri(operation["uri"])
+                        and operation["uri"] not in prepared_resources
+                    ],
+                    ctx=ctx,
+                )
             for operation, existed, write_mode in pending:
                 uri = operation["uri"]
                 try:
@@ -614,28 +597,6 @@ class ContentWriteCoordinator:
                     created.append(uri)
                     if prepared is None:
                         refresh_kinds[uri] = "added"
-            commit_oid = None
-            if commit_folder and write_error is None:
-                commit_oid = await commit_snapshot(
-                    self._viking_fs,
-                    [normalized_root],
-                    f"batch write {normalized_root}",
-                    ctx,
-                    lease_ref=lease,
-                )
-            if not commit_folder or write_error is not None or commit_oid is not None:
-                await self._commit_content([*created, *updated], lease, snapshot_id=commit_oid)
-            if commit_folder:
-                # Refresh retains file locks without blocking the entire directory.
-                file_lease = await self._viking_fs._async_agfs.pathlock_acquire_exact_batch(
-                    target_paths, owner_lease_ref=lease
-                )
-                try:
-                    await self._viking_fs._async_agfs.pathlock_release(lease)
-                except BaseException:
-                    await self._viking_fs._async_agfs.pathlock_release(file_lease)
-                    raise
-                lease = file_lease
         except BaseException:
             await self._viking_fs._async_agfs.pathlock_release(lease)
             raise
@@ -644,7 +605,9 @@ class ContentWriteCoordinator:
         coordinator_work_id: str | None = None
         refresh_outcome: Optional[_BatchRefreshOutcome] = None
         try:
-            if refresh_kinds or sidecar_directories or committed_resource_plans:
+            if not defer_processing and (
+                refresh_kinds or sidecar_directories or committed_resource_plans
+            ):
                 coordinator_work_id = await self._enqueue_lock_coordinator(
                     root_uri=normalized_root,
                     context_type=context_type_for_uri(normalized_root),
@@ -780,9 +743,9 @@ class ContentWriteCoordinator:
         }
         if skip_conflicts:
             result["conflicts"] = conflicts
-        if commit_folder:
-            result["commit_oid"] = commit_oid
-        if refresh_outcome is not None:
+        if defer_processing:
+            result.update(semantic_status="deferred", vector_status="deferred")
+        elif refresh_outcome is not None:
             semantic_status, vector_status = refresh_outcome.statuses(wait=wait and wait_for_queues)
             result["semantic_status"] = semantic_status
             result["vector_status"] = vector_status

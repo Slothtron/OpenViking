@@ -390,3 +390,70 @@ async def test_reindex_processor_does_not_release_lease_owned_by_failed_executor
     assert outcome.outcome.value == "failed"
     agfs.pathlock_release.assert_awaited_once_with({"lease": "root"})
     tracker.fail.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["enqueue", "enqueue_committed", "handoff", "record"])
+async def test_async_reindex_reuses_accepted_task_on_replay(monkeypatch, failure):
+    from openviking.server.identity import RequestContext, Role
+    from openviking.service.reindex_executor import REINDEX_ENQUEUE_ERROR, ReindexExecutor
+    from openviking.service.task_store import PersistentTaskStore
+    from openviking.service.task_tracker import TaskTracker
+    from openviking.service.task_work_index import QueueTaskMetadata, TaskWorkIndex
+    from openviking_cli.exceptions import OpenVikingError
+    from openviking_cli.session.user_id import UserIdentifier
+    from tests.test_task_tracker import _FakeAgfs
+
+    owner = {"account_id": "account-1", "user_id": "user-1"}
+    tracker = TaskTracker(PersistentTaskStore(_FakeAgfs()))
+    index = TaskWorkIndex()
+    tracker.attach_work_index(index)
+    monkeypatch.setattr("openviking.service.reindex_executor.get_task_tracker", lambda: tracker)
+    agfs = SimpleNamespace(
+        pathlock_acquire_tree=AsyncMock(return_value={"lease": "root"}),
+        pathlock_to_handoff=AsyncMock(return_value={"owner_id": "root"}),
+        pathlock_handoff=AsyncMock(
+            side_effect=OSError("handoff") if failure == "handoff" else None
+        ),
+        pathlock_release=AsyncMock(),
+    )
+    fs = SimpleNamespace(
+        _async_agfs=agfs,
+        stat=AsyncMock(return_value={"isDir": True}),
+        _uri_to_path=lambda *a, **kw: "/target",
+    )
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_service", lambda: SimpleNamespace(viking_fs=fs)
+    )
+
+    async def enqueue(_queue, payload):
+        if failure == "enqueue":
+            raise OSError("enqueue")
+        index.register("Reindex", QueueTaskMetadata(payload["task_id"], "work-1", **owner))
+        if failure == "enqueue_committed":
+            raise OSError("enqueue response lost")
+        return "queued"
+
+    queue = SimpleNamespace(REINDEX="Reindex", enqueue=AsyncMock(side_effect=enqueue))
+    monkeypatch.setattr("openviking.storage.queuefs.get_queue_manager", lambda: queue)
+    if failure == "record":
+        monkeypatch.setattr(tracker, "update_stage", AsyncMock(side_effect=OSError("record")))
+    executor = ReindexExecutor()
+    params = {
+        "uri": "viking://resources/demo",
+        "mode": "semantic_and_vectors",
+        "wait": False,
+        "ctx": RequestContext(user=UserIdentifier("account-1", "user-1"), role=Role.USER),
+        "task_id": "compile-reindex",
+    }
+    with pytest.raises(OSError):
+        await executor.execute(**params)
+    task = await tracker.get(params["task_id"], **owner)
+    if failure == "enqueue":
+        assert task.error == REINDEX_ENQUEUE_ERROR
+        with pytest.raises(OpenVikingError, match=REINDEX_ENQUEUE_ERROR):
+            await executor.execute(**params)
+    else:
+        result = await executor.execute(**params)
+        assert result["task_id"] == params["task_id"] and result["status"] == "accepted"
+    assert queue.enqueue.await_count == 1

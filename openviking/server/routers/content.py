@@ -84,8 +84,8 @@ class BatchWriteRequest(BaseModel):
     telemetry: TelemetryRequest = False
     # Preserve conflicting target files and return their URI/reason while writing other files.
     skip_conflicts: bool = False
-    # Snapshot root_uri after writing and before scheduling semantic refreshes.
-    commit_folder: bool = False
+    # Save content without semantic or vector work; the caller schedules processing.
+    defer_processing: bool = False
     processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE
 
 
@@ -302,7 +302,7 @@ async def batch_write(
             ctx=_ctx,
             wait=request.wait,
             skip_conflicts=request.skip_conflicts,
-            commit_folder=request.commit_folder,
+            defer_processing=request.defer_processing,
             processing_mode=request.processing_mode,
         ),
     )

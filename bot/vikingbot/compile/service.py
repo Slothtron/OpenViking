@@ -932,6 +932,7 @@ class BotCompileService:
                         root_uri=request.to,
                         operations=rendered.operations,
                         wait=False,
+                        defer_processing=True,
                     )
                 except OpenVikingError as exc:
                     if exc.code == "CONFLICT":
@@ -1126,7 +1127,7 @@ class BotCompileService:
                     operations=rendered.operations,
                     wait=False,
                     skip_conflicts=True,
-                    commit_folder=True,
+                    defer_processing=True,
                 )
             conflicts = result.get("conflicts", [])
             for conflict in conflicts:
@@ -1173,8 +1174,6 @@ class BotCompileService:
             def complete(task):
                 if task.status not in TERMINAL_STATUSES and task.status != "cancelling":
                     record_metrics(task)
-                    if "commit_oid" in result:
-                        task.meta["commit_oid"] = result["commit_oid"]
                     task.status = "completed" if published else "failed"
                     task.stage = "completed" if published else "writing"
                     task.result = compiled

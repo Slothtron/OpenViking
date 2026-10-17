@@ -884,8 +884,9 @@ class OpenVikingService:
         tags: list[str] | None = None,
         tag_mode: str = "replace",
         ctx: RequestContext | None = None,
+        task_id: str | None = None,
     ) -> dict[str, Any]:
-        """Reindex semantic/vector artifacts for a URI."""
+        """Reindex a URI; task_id preserves internal async submission identity."""
         if not self._initialized:
             await self.initialize()
 
@@ -909,6 +910,8 @@ class OpenVikingService:
         if tags is not None or tag_mode == "clear":
             execute_kwargs["tags"] = tags
             execute_kwargs["tag_mode"] = tag_mode
+        if task_id is not None:
+            execute_kwargs["task_id"] = task_id
         return await executor.execute(**execute_kwargs)
 
     async def check_consistency(
