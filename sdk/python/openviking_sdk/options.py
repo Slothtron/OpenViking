@@ -135,7 +135,6 @@ class TreePage(TypedDict):
 
 class CreateSessionOptions(_ExtraOptions, total=False):
     memory_policy: Dict[str, Any]
-    privacy_policy: Dict[str, Any]
     auto_commit_policy: Optional[Dict[str, Any]]
     memory_extraction_config: Dict[str, Any]
     telemetry: Any

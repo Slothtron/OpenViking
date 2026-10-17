@@ -19,7 +19,6 @@ func (c *Client) CreateSession(ctx context.Context, opts *CreateSessionOptions) 
 	payload := map[string]any{}
 	setString(payload, "session_id", opts.SessionID)
 	setAny(payload, "memory_policy", opts.MemoryPolicy)
-	setAny(payload, "privacy_policy", opts.PrivacyPolicy)
 	if opts.DisableAutoCommit {
 		payload["auto_commit_policy"] = nil
 	} else {

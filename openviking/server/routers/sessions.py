@@ -177,7 +177,6 @@ class CreateSessionRequest(BaseModel):
 
     session_id: Optional[str] = None
     memory_policy: Optional[Dict[str, Any]] = None
-    privacy_policy: Optional[Dict[str, Any]] = None
     auto_commit_policy: Optional[AutoCommitPolicyRequest] = None
     memory_extraction_config: Optional[MemoryExtractionConfigRequest] = None
     telemetry: TelemetryRequest = False
@@ -321,7 +320,6 @@ async def create_session(
             _ctx,
             request.session_id,
             memory_policy=request.memory_policy,
-            privacy_policy=request.privacy_policy,
             auto_commit_policy=auto_commit_policy_payload,
             update_auto_commit_policy=update_auto_commit_policy,
             event_tags=event_tags,
@@ -330,7 +328,6 @@ async def create_session(
             "session_id": session.session_id,
             "uri": session.uri,
             "user": session.user.to_dict(),
-            "privacy_policy": service.sessions.effective_privacy_policy(session),
             "auto_commit_policy": service.sessions.effective_auto_commit_policy(session),
             "memory_extraction_config": service.sessions.effective_memory_extraction_config(
                 session

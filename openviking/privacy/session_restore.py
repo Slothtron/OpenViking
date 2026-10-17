@@ -4,14 +4,12 @@
 
 import json
 import re
-from typing import Any, Optional
+from typing import Any
 
 from openviking.core.namespace import canonical_session_root
 from openviking.privacy.service import UserPrivacyConfigService
 from openviking.server.identity import RequestContext
-from openviking.session.privacy_policy import PrivacyPolicy
-from openviking.storage.viking_fs import VikingFS
-from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
+from openviking_cli.exceptions import InvalidArgumentError
 
 # Text fields that may contain placeholders, keyed by Part type.
 _TEXT_FIELDS = {
@@ -95,37 +93,17 @@ def restore_session_content(
     return "\n".join(lines)
 
 
-async def _read_session_policy(
-    viking_fs: VikingFS, session_root: str, session_id: str, ctx: RequestContext
-) -> PrivacyPolicy:
-    try:
-        meta = json.loads(
-            await viking_fs.read_file(f"{session_root}/{session_id}/.meta.json", ctx=ctx)
-        )
-    except (NotFoundError, FileNotFoundError):
-        return PrivacyPolicy()
-    return PrivacyPolicy.from_dict(meta.get("privacy_policy"))
-
-
 async def restore_session_read(
-    viking_fs: VikingFS,
-    privacy: Optional[UserPrivacyConfigService],
-    uri: str,
-    content: str,
-    ctx: RequestContext,
+    privacy: UserPrivacyConfigService | None, uri: str, content: str, ctx: RequestContext
 ) -> str:
-    """Apply the Session's restore policy to content read from ``uri``."""
+    """Resolve current values after visible-read sanitization, without rewriting disk."""
     session_root = canonical_session_root(ctx)
     session_id = get_session_id_from_uri(uri, session_root)
-    # Skip policy and snapshot reads unless this Session's placeholder is present.
     if (
         privacy is None
         or session_id is None
         or f"{{{{ov_privacy:session:{session_id}:" not in content
     ):
-        return content
-    policy = await _read_session_policy(viking_fs, session_root, session_id, ctx)
-    if not policy.restore_enabled:
         return content
     current = await privacy.get_current(ctx, "session", session_id)
     if current is None:

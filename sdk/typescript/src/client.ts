@@ -760,7 +760,6 @@ export class OpenVikingClient {
     const body = compact({
       session_id: options.sessionId,
       memory_policy: options.memoryPolicy,
-      privacy_policy: options.privacyPolicy,
       memory_extraction_config: options.memoryExtractionConfig,
       telemetry: options.telemetry,
     });
