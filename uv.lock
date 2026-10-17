@@ -3655,6 +3655,9 @@ eval = [
     { name = "pandas", version = "3.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "ragas" },
 ]
+expiry = [
+    { name = "redis" },
+]
 gateway-fast = [
     { name = "httptools" },
     { name = "uvloop", marker = "sys_platform != 'win32'" },
@@ -3804,6 +3807,7 @@ requires-dist = [
     { name = "ragas", marker = "extra == 'test'", specifier = ">=0.1.0" },
     { name = "rapidfuzz", specifier = ">=3.14,<4" },
     { name = "readability-lxml", marker = "extra == 'bot'", specifier = ">=0.8.0" },
+    { name = "redis", marker = "extra == 'expiry'", specifier = ">=5,<7" },
     { name = "redis", marker = "extra == 'redis-mysql'", specifier = ">=5.0,<7" },
     { name = "redis", marker = "extra == 'test'", specifier = ">=5.0,<7" },
     { name = "requests", specifier = ">=2.33.0" },
@@ -3848,7 +3852,7 @@ requires-dist = [
     { name = "wheel", marker = "extra == 'build'" },
     { name = "xxhash", specifier = ">=3.0.0" },
 ]
-provides-extras = ["gateway-fast", "mysql", "redis-mysql", "test", "auth", "dev", "doc", "eval", "gemini", "gemini-async", "ocr", "build", "bot", "benchmark", "local-embed", "opengauss"]
+provides-extras = ["expiry", "gateway-fast", "mysql", "redis-mysql", "test", "auth", "dev", "doc", "eval", "gemini", "gemini-async", "ocr", "build", "bot", "benchmark", "local-embed", "opengauss"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=9.0.2" }]

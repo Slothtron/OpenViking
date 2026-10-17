@@ -1,36 +1,25 @@
-# Privacy Configs and Automatic Management
+# Privacy Configs and Skill Privacy Extraction/Restore
 
-This page explains OpenViking privacy configs and how they work with skill and session write-time extraction and read-time restore.
+This page explains OpenViking privacy configs and how they work with skill write-time extraction and read-time restore.
 
 ## Goal
 
-Privacy configs separate sensitive values (such as `api_key` and `token`) from content (such as skills and sessions). Automatically detected values are saved in the OpenViking user's privacy configs with version history. Content stores placeholders that can be restored from the active config at read time.
+Privacy configs separate sensitive values (such as `api_key`, `token`, `base_url`) from skill body content to reduce plaintext storage of recognized values in `SKILL.md`, with version lookup and switching. Extraction relies on a model and replaces only recognized, matched spans; it does not guarantee discovery of every sensitive value.
 
 Core goals:
 
-- Extract sensitive values at write time and replace them with placeholders
-- Restore values at read time according to the content type and policy
+- Auto-extract sensitive values at write time and replace with placeholders
+- Auto-restore values from the active config at read time
 - Provide version query, switching, and auditability
-
-Skills and sessions share the same privacy storage, but use different extraction and restore behavior:
-
-| Content | Sensitive Value Extraction | Sensitive Value Restore |
-|---|---|---|
-| Skill | **Model-based** extraction from the skill body | Replace placeholders with sensitive values from the active config when reading SKILL.md |
-| Session | **Rule-based** credential detection in messages; enabled by default | Replace placeholders with sensitive values from the active config when reading message files, archived messages, and externalized tool outputs |
-
-Both methods replace only recognized, matched values; neither guarantees discovery of every sensitive value. Unmatched content remains unchanged.
 
 ---
 
 ## Core Objects and Storage Layout
 
-Privacy configs are keyed by `category + target_key` within the current user's space.
+Privacy configs are keyed by `category + target_key`.
 
-| Content | `category` | `target_key` |
-|---|---|---|
-| Skill | `skill` | Skill name |
-| Session | `session` | Session ID |
+- `category`: config category (currently skill uses `skill`)
+- `target_key`: target identifier (usually the skill name)
 
 Storage layout in user space:
 
@@ -39,12 +28,12 @@ viking://user/{user_id}/privacy/{category}/{target_key}/
 ├── .meta.json                 # metadata (active_version/latest_version/labels, etc.)
 ├── current.json               # active version snapshot
 └── history/
-    ├── version_001.json
-    ├── version_002.json
+    ├── version_1.json
+    ├── version_2.json
     └── ...
 ```
 
-`current.json` and `history/version_x.json` contain full privacy value maps (`values`). Session and skill bodies store references to these values (placeholders).
+`current.json` and `history/version_x.json` are full `values` snapshots.
 
 ---
 
@@ -66,9 +55,7 @@ viking://user/{user_id}/privacy/{category}/{target_key}/
 
 ---
 
-## Skill Privacy Extraction and Restore
-
-### Automatic Extraction (Write Path)
+## Skill Privacy Extraction (Write Path)
 
 When adding a skill via `add_skill`, OpenViking runs extraction + placeholderization.
 
@@ -81,7 +68,7 @@ add_skill
   -> write placeholderized SKILL.md
 ```
 
-#### Key Points
+### Key Points
 
 1. **Extraction source**: model returns JSON; `values` is used as privacy key-value pairs.  
 2. **Content replacement**: matched plaintext is replaced by placeholders:
@@ -93,7 +80,7 @@ add_skill
 
 ---
 
-### Restore on Read (Load Path)
+## Skill Restore on Read (Load Path)
 
 When reading `SKILL.md`, `FSService.read` attempts placeholder restoration automatically.
 
@@ -104,14 +91,14 @@ fs.read(uri)
   -> restore_skill_content(content, skill_name, current.values)
 ```
 
-#### URI Matching
+### URI Matching
 
 Current matching is suffix-based: `/skills/{name}/SKILL.md`, so it supports user-scoped skill paths such as:
 
 - `viking://~/skills/{name}/SKILL.md`
 - `viking://user/{user_id}/skills/{name}/SKILL.md`
 
-#### restore Rules
+### restore Rules
 
 `restore_skill_content` behavior:
 
@@ -135,88 +122,36 @@ Current matching is suffix-based: `/skills/{name}/SKILL.md`, so it supports user
 
 `read` returns restored values, and extra-config notices also include values. Privacy APIs and historical snapshots can return full values as well. This feature does not redact responses or encrypt storage; see [Storage Encryption](./10-encryption.md) for encryption.
 
-## Session Privacy Extraction and Restore
-
-### Automatic Extraction (Write Path)
-
-When writing messages to a session, OpenViking uses `privacy_policy` to control sensitive value extraction and replacement with placeholders. Extraction is enabled by default and runs before tool outputs are externalized and messages are persisted.
-
-```
-Session.add_messages_async
-  -> resolve privacy_policy and check extract.enabled
-  -> extract_session_privacy_values (use rules to detect values and create message copies with placeholders)
-  -> privacy.merge_values(category="session", target_key=session_id, values=...)
-  -> externalize tool outputs
-  -> append messages with placeholders
-```
-
-#### Key Points
-
-1. **Extraction source**: rules recognize credentials without calling a model. Supported patterns include `password=...`, `api_key=...`, `Authorization: Bearer ...`, CLI credential arguments, and token formats such as `sk-...`.
-2. **Coverage**: extraction processes TextPart text, ContextPart abstracts, and ToolPart inputs, outputs, and externalization error text. Images are not scanned.
-3. **Content replacement**: matched sensitive values are replaced by placeholders:
-   - <code>&#123;&#123;ov_privacy:session:&#123;session_id&#125;:value_&lt;random-id&gt;&#125;&#125;</code>
-   - Keys are random IDs rather than sensitive field names. Existing privacy placeholders and environment variable references are not treated as new credentials.
-4. **Persisted content**: new values are merged into the active privacy snapshot before messages are saved, preserving values referenced by earlier messages. If no values are extracted, the privacy config is not written. If extraction or saving the config fails, the batch is rejected without falling back to plaintext storage.
-
----
-
-### Restore on Read (Load Path)
-
-When reading session message files or externalized tool outputs, `FSService.read` checks `privacy_policy` to determine whether to restore placeholders. Restoration is disabled by default; when enabled, it uses the active privacy config.
-
-```
-fs.read(uri)
-  -> restore_session_read
-    -> get_session_id_from_uri (match a session file)
-    -> check for this session's placeholders and read restore.enabled
-    -> privacy.get_current(category="session", target_key=session_id)
-    -> restore_session_content(content, session_id, current.values)
-```
-
-#### URI Matching
-
-Only the following files under the current user's session root are eligible for restore:
-
-- `sessions/{session_id}/messages.jsonl`
-- `sessions/{session_id}/history/archive_*/messages.jsonl`
-- `sessions/{session_id}/tool-results/{id}/output.txt`
-
-Policy and privacy snapshot lookups are skipped if the path is outside this scope or the content contains no placeholder for that session.
-
-#### Restoration Rules
-
-`restore_session_content` replaces session placeholders with the corresponding values from the active privacy config. Placeholders without a matching value remain unchanged.
-
-> Content restoration runs only when `restore.enabled=true` and a `current` config exists for that session; otherwise, the original content is returned. Restoration affects only the read result and does not write back to the file. Session context, compression summaries, memory extraction, and search results retain placeholders.
-
-### Session Privacy Policy
-
-Set extraction and restore switches through `privacy_policy` when creating a session. The policy cannot be changed afterwards; see [Sessions API](../api/05-sessions.md) for creation parameters and SDK examples.
-
-Deleting a session does not delete its privacy config. This retains values that may still be referenced by extracted memories; it does not enable automatic restore for memory reads.
-
----
-
 ## Relationship with CLI/API
 
 - Management plane: Privacy API/CLI for versions (query, write, rollback)
-- Content plane: `read` restores placeholders automatically according to the content's restore policy
-- Separation of concerns: content files hold placeholders; the privacy service holds sensitive values and versions
+- Content plane: `read` automatically restores placeholders
+- Separation of concerns: content files hold placeholders; privacy service holds sensitive values and versions
 
-Common commands:
+PrivacySanitizer does not infer sensitivity from field names. String values in the active Privacy catalog participate in automatic content scanning and reference replacement only when they contain at least 6 Unicode characters. Shorter values can still be stored, referenced, and explicitly resolved, but are excluded from global substring replacement to reduce false positives in ordinary text. Python owns catalog loading, reference generation, and cache policy; matcher construction, leftmost-longest matching, and text rewriting run in RAGFS's Rust Aho-Corasick implementation through a reusable PyO3 matcher that releases the GIL while scanning. The matcher catalog is cached per user and process-local revision; local changes invalidate it immediately, and a 3600-second TTL bounds staleness after changes made by another worker or node.
+
+Using a GitHub Personal Access Token (PAT) as an example:
 
 ```bash
-ov privacy categories
-ov privacy list skill
-ov privacy get skill search-web
-ov privacy upsert skill search-web --values-json '{"api_key":"..."}'
-ov privacy activate skill search-web 1
-ov read viking://~/skills/search-web/SKILL.md
+# Create or rotate the PAT; credential/github is the target and pat is the field
+ov privacy upsert credential github --field-pat 'github_pat_...'
 
-ov privacy list session
-ov privacy get session demo
-ov read viking://~/sessions/demo/messages.jsonl
+# Omit the field when pat is the target's only field
+ov privacy reference credential github
+ov privacy resolve credential github
+
+# Equivalent explicit-field forms
+ov privacy reference credential github pat
+ov privacy resolve credential github pat
+ov privacy resolve '{{ov_privacy:alice:viking://~/privacy/credential/github#/values/pat}}'
+
+# Inspect/activate history, or remove pat (the final field also removes the target)
+ov privacy versions credential github
+ov privacy activate credential github 1
+ov privacy delete credential github pat --yes
+
+# Scan one explicit URI; the default only reports, while --fix replaces plaintext PATs
+ov privacy scan --uri viking://~/resources/project-a
 ```
 
 ---
@@ -226,14 +161,13 @@ ov read viking://~/sessions/demo/messages.jsonl
 - Reduces plaintext sensitive data exposure in skill content
 - Version history supports configuration changes after external credential rotation
 - Transparent to callers: `read` returns restored executable skill text
-- Notice blocks improve troubleshooting when config is incomplete or over-provisioned
+- Notice block improves troubleshooting when config is incomplete or over-provisioned
 
 ---
 
 ## Related Documentation
 
 - [Skills](../api/04-skills.md) - Skill write/read API
-- [Sessions](../api/05-sessions.md) - Session creation and message writes
 - [Privacy API](../api/10-privacy.md) - Privacy config endpoints
 - [Context Extraction](./06-extraction.md) - Main extraction pipeline
 - [Architecture Overview](./01-architecture.md) - Layering and module relationships
