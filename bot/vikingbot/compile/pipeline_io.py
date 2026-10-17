@@ -246,14 +246,6 @@ class JsonModel:
             name: getattr(backend, name, None)
             for name in ("model", "thinking", "temperature", "max_tokens", "reasoning_effort")
         }
-        self.identity["thinking"]["compile"] = self.identity["backend_settings"]["thinking"]
-        # Explicit Ark configuration controls direct generation without changing other stages.
-        self.identity["reasoning_effort"] = (
-            {"compile": backend.reasoning_effort}
-            if getattr(backend, "provider", None) == "volcengine"
-            and getattr(backend, "reasoning_effort", None) is not None
-            else {}
-        )
         configured_tokens = self.identity["backend_settings"]["max_tokens"]
         self.max_tokens = (
             configured_tokens

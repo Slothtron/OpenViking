@@ -343,24 +343,36 @@ async def run(runtime: Pipeline, references: list[str]) -> RenderedBundle:
                 {path: file_ops.encode_content(raw)["content"] for path, raw in retained.items()}
             )
 
+    review_prompt = _REVIEW + runtime.output_instructions
+    if runtime.changes is not None:
+        review_prompt += (
+            "\nThis is an incremental update: only modify content affected by the current inputs, "
+            "preserve all other existing content, and do not treat information absent from these "
+            "inputs as unsupported or obsolete.\n"
+        )
     original_finalized = deepcopy(finalized)
     try:
-        async with asyncio.timeout(runtime.limits.pipeline_agent_seconds):
-            decision = await runtime.model.agent_runner(
-                _REVIEW + runtime.output_instructions,
-                {
-                    "skill_directory": "skill",
-                    "task": runtime.request.instruction,
-                    "target": runtime.target,
-                    "source_directory": "sources",
-                    "artifact_directory": directory,
-                },
-                FinalReview,
-                validate_review,
-                runtime.model,
-                stage="final_review_agent",
-            )
+        try:
+            async with asyncio.timeout(max(1200, 2 * runtime.model.timeout)):
+                decision = await runtime.model.agent_runner(
+                    review_prompt,
+                    {
+                        "skill_directory": "skill",
+                        "task": runtime.request.instruction,
+                        "target": runtime.target,
+                        "source_directory": "sources",
+                        "artifact_directory": directory,
+                    },
+                    FinalReview,
+                    validate_review,
+                    runtime.model,
+                    stage="final_review_agent",
+                )
+                await validate_review(decision)
+        except TimeoutError:
+            decision = FinalReview(excluded={})
             await validate_review(decision)
+            runtime.warnings.append("Final review timed out; publishing validated staged artifacts")
     except Exception as exc:
         error = f"Final review incomplete; publishing original artifacts: {str(exc) or type(exc).__name__}"
         runtime.warnings.append(error)

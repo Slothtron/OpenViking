@@ -252,8 +252,8 @@ class EmitResult(Tool):
 def agent_runner(loop, session_key, connection, limits):
     """Bind an isolated child adapter; queueing/cancellation remain owned by Pipeline.
 
-    Each call has fresh history, a private scratch root and the existing subagent
-    iteration limit. Large files are submitted by reference, then hashed and checked.
+    Each call has fresh history, a private scratch root and its stage's iteration
+    limit. Large files are submitted by reference, then hashed and checked.
     Skill reads use the authenticated task client. Final review can browse task files,
     with writes confined to its staged outputs and no shell access.
     """
@@ -355,7 +355,9 @@ def agent_runner(loop, session_key, connection, limits):
             inject_write_experience=False,
             agent_id=child_id,
             context_compact_budget=None,
-            max_iterations=limits.subagent_iterations,
+            max_iterations=(
+                limits.final_review_iterations if final_review else limits.subagent_iterations
+            ),
             should_stop=lambda: not submit.can_retry,
         )
         if submit.result is None:
