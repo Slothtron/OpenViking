@@ -19,6 +19,7 @@ from openviking.service.task_tracker_concurrency import (
     run_to_completion,
 )
 from openviking.service.task_work_index import bind_task_context
+from openviking.storage.errors import ResourceBusyError
 from openviking.storage.queuefs import QueueManager, get_queue_manager
 from openviking_cli.exceptions import ConflictError
 from openviking_cli.utils.logger import get_logger
@@ -458,7 +459,12 @@ class ExternalTaskService:
             )
         auth = await self._task_auth(task_id, account_id, user_id)
         if task.stage in {None, "queued"} and not auth.get("external_task_id"):
-            self._release(task)
+            await self._apply_snapshot(
+                ExternalTaskSnapshot(status="cancelled"),
+                task_id=task_id,
+                account_id=account_id,
+                user_id=user_id,
+            )
             return
         await self._cancel_external(
             self._provider(task.task_type),
@@ -520,7 +526,16 @@ class ExternalTaskService:
         if task is not None:
             on_finish = getattr(self._providers.get(task.task_type), "on_finish", None)
             if on_finish is not None:
-                snapshot = await run_to_completion(lambda: on_finish(task, snapshot))
+
+                async def finish():
+                    """Keep lock retries inside cancellation-protected provider finalization."""
+                    while True:
+                        try:
+                            return await on_finish(task, snapshot)
+                        except ResourceBusyError:
+                            await asyncio.sleep(self._providers[task.task_type].poll_interval_seconds)
+
+                snapshot = await run_to_completion(finish)
 
         async def finalize() -> None:
             if snapshot.status == "failed":

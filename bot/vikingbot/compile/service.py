@@ -1165,7 +1165,7 @@ class BotCompileService:
                         ]
                     )
                 ),
-                page_count=len(set(rendered.wiki_uris) & set(published)),
+                page_count=len(set(published)),
                 link_count=rendered.link_count,
                 link_report=rendered.link_report,
                 warnings=pipeline.warnings,

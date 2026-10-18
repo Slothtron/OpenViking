@@ -168,6 +168,121 @@ async def test_busy_start_requeues_until_path_unlocks(service, monkeypatch, lock
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_at", ["pending", "requeue"])
+async def test_queued_cancel_finishes_history_without_releasing_running_task(
+    service, compile_task, monkeypatch, cancel_at
+):
+    """Cancel B before dispatch or during rotation while A retains the shared target."""
+    ctx, first = compile_task
+    compile_service = service.compile
+    tracker = get_task_tracker()
+    manager = get_queue_manager()
+    queue = manager.get_queue("ExternalTask")
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def poll(task_id, *args, **kwargs):
+        if task_id == first.task_id:
+            entered.set()
+            await release.wait()
+        return ExternalTaskSnapshot(status="completed")
+
+    submit = AsyncMock(side_effect=lambda task_id, *args, **kwargs: task_id)
+    monkeypatch.setattr(compile_service, "submit", submit)
+    monkeypatch.setattr(compile_service, "get", poll)
+    worker = asyncio.create_task(queue.dequeue())
+    await asyncio.wait_for(entered.wait(), 5)
+    try:
+        request = CompileRequest.model_validate(
+            {"from": [SRC], "to": TO, "skill": SKILL, "instruction": "refresh"}
+        )
+        queued = await compile_service.create(request, connection={}, ctx=ctx)
+        if cancel_at == "pending":
+            await tracker.cancel(queued.task_id, ctx.account_id, ctx.user.user_id)
+        else:
+            enqueue = manager.enqueue
+
+            async def cancel_before_rotation(queue_name, data, **kwargs):
+                if queue_name == manager.EXTERNAL_TASK and data.get("task_id") == queued.task_id:
+                    await tracker.record_cancelled(queued.task_id, ctx.account_id, ctx.user.user_id)
+                return await enqueue(queue_name, data, **kwargs)
+
+            monkeypatch.setattr(manager, "enqueue", cancel_before_rotation)
+        await queue.dequeue()
+        current = await tracker.get(queued.task_id, ctx.account_id, ctx.user.user_id)
+        assert current.status == "cancelled"
+        store = compile_service.lifecycle.store
+        target_id = first.meta["request"]["compile"]["target_id"]
+        run = await store.get_run(ctx.account_id, target_id, queued.task_id)
+        assert run["status"] == "cancelled" and run["finished_at"] is not None
+        assert run["started_at"] is None
+        assert (await store.get(ctx.account_id, target_id))["active_task_id"] == first.task_id
+    finally:
+        release.set()
+        await asyncio.wait_for(worker, 10)
+    assert (await tracker.get(first.task_id, ctx.account_id, ctx.user.user_id)).status == "completed"
+    assert (await store.get(ctx.account_id, target_id))["active_task_id"] is None
+    submit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cancel_waits_for_output_lock_before_releasing_target(service, compile_task, monkeypatch):
+    """Cancellation retains target ownership until rollback can preserve ordinary edits."""
+    from openviking.storage.errors import ResourceBusyError
+
+    ctx, task = compile_task
+    compile_service = service.compile
+    lifecycle = compile_service.lifecycle
+    tracker = get_task_tracker()
+    queue = get_queue_manager().get_queue("ExternalTask")
+    polling, busy = asyncio.Event(), asyncio.Event()
+
+    async def poll(*args, **kwargs):
+        polling.set()
+        await asyncio.Event().wait()
+
+    finish = lifecycle.on_finish
+
+    async def finish_with_lock_check(*args, **kwargs):
+        try:
+            return await finish(*args, **kwargs)
+        except ResourceBusyError:
+            busy.set()
+            raise
+
+    monkeypatch.setattr(compile_service, "submit", AsyncMock(return_value="runtime-task"))
+    monkeypatch.setattr(compile_service, "get", poll)
+    monkeypatch.setattr(
+        compile_service, "cancel", AsyncMock(return_value=ExternalTaskSnapshot(status="cancelled"))
+    )
+    monkeypatch.setattr(lifecycle, "on_finish", finish_with_lock_check)
+    worker = asyncio.create_task(queue.dequeue())
+    await asyncio.wait_for(polling.wait(), 5)
+    uri = f"{TO}/page.md"
+    await service.fs.write(uri, "ordinary", ctx, processing_mode="vectors_only", wait=True)
+    await _write(service, uri, "compile output", ctx)
+    agfs = service.viking_fs._async_agfs
+    lease = await agfs.pathlock_acquire_exact(service.viking_fs._uri_to_path(uri, ctx=ctx))
+    try:
+        await tracker.cancel(task.task_id, ctx.account_id, ctx.user.user_id)
+        await asyncio.wait_for(busy.wait(), 5)
+        await asyncio.sleep(0.05)
+        current = await tracker.get(task.task_id, ctx.account_id, ctx.user.user_id)
+        assert current.status == "cancelling"
+        record = await lifecycle.store.get(ctx.account_id, task.meta["request"]["compile"]["target_id"])
+        run = await lifecycle.store.get_run(ctx.account_id, record["id"], task.task_id)
+        assert run["finished_at"] is None and record["active_task_id"] == task.task_id
+    finally:
+        await agfs.pathlock_release(lease)
+        await asyncio.wait_for(worker, 10)
+    assert (await tracker.get(task.task_id, ctx.account_id, ctx.user.user_id)).status == "cancelled"
+    record = await lifecycle.store.get(ctx.account_id, record["id"])
+    run = await lifecycle.store.get_run(ctx.account_id, record["id"], task.task_id)
+    assert run["status"] == "cancelled" and run["finished_at"] is not None
+    assert record["active_task_id"] is None
+    assert await service.viking_fs.read_file(uri, ctx=ctx) == "ordinary"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["commit", "reindex", "git_disabled"])
 async def test_finish_commits_then_reindexes_and_resumes(
     service, monkeypatch, compile_task, failure

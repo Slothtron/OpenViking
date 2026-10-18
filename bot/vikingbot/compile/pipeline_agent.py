@@ -277,6 +277,10 @@ def agent_runner(loop, session_key, connection, limits):
             evidence.delivered.clear()
         registry = ToolRegistry(config=loop.config)
         registry.register(submit)
+        if final_review:
+            tool = loop.tools.get("openviking_glob")
+            if tool is not None:
+                registry.register(tool)
         if model.resources:
             registry.register(model.resources)
         if evidence.allowed - evidence.delivered:

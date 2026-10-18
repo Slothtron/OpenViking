@@ -60,8 +60,14 @@ Inspect the available output structure first. Use any manifests, navigation, ref
 or other delivery descriptions when present; do not assume a particular output format.
 Read individual outputs and relevant sources only as needed to investigate a suspected
 major omission. Do not perform an exhaustive content audit by default.
-Absence from the current staging directory alone does not prove that retained target
-content is missing.
+The staging directory contains only this Compile's outputs, not the complete target.
+When a generated or updated output references a file absent from staging, use
+openviking_glob with uri=target and a recursive pattern for the referenced filename
+to check the real target before treating the reference as a major omission. Any matching
+filename under target is sufficient for this check; preserve the reference and do not
+create a placeholder or exclude an otherwise usable output because of it. Only a
+successful query with no matches establishes absence from the target. Tool errors do
+not establish absence. Check only suspected missing references; do not scan all files.
 
 Repair confirmed omissions by creating missing outputs or completing placeholder content,
 following the Skill and supported source material. Preserve existing substantive content.
