@@ -52,7 +52,7 @@ class WriteContentRequest(BaseModel):
     tag_mode: Literal["replace", "append", "clear"] = "replace"
     acl: AclSpec | None = None
     # Who made the edit; versions of Compile outputs record it (console edit = manual).
-    edit_source: Literal["manual", "agent"] = "agent"
+    edit_source: Literal["manual", "agent", "compile"] = "agent"
 
 
 class BatchWriteOperation(BaseModel):

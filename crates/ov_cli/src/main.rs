@@ -844,7 +844,7 @@ enum Commands {
         #[arg(
             long = "edit-source",
             default_value = "agent",
-            value_parser = ["manual", "agent"],
+            value_parser = ["manual", "agent", "compile"],
             help_heading = "Advanced options"
         )]
         edit_source: String,
@@ -5026,11 +5026,14 @@ mod tests {
             "content",
             "--tag-mode",
             "clear",
+            "--edit-source",
+            "compile",
         ])
-        .expect("write clear mode should parse");
+        .expect("write clear mode with Compile source should parse");
         assert!(matches!(
             write.command,
-            Commands::Write { tag_mode, tags, .. } if tag_mode == "clear" && tags.is_empty()
+            Commands::Write { tag_mode, tags, edit_source, .. }
+                if tag_mode == "clear" && tags.is_empty() && edit_source == "compile"
         ));
 
         let reindex = Cli::try_parse_from([

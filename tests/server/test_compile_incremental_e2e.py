@@ -53,6 +53,23 @@ async def _write(service, uri, text, ctx):
     await service.viking_fs.write_file(uri, text, ctx=ctx)
 
 
+@pytest.fixture(params=["single", "batch"])
+def compile_write(service, request):
+    """Exercise both execution adapters against the same lifecycle assertions."""
+
+    async def write(ctx, uri, content):
+        if request.param == "single":
+            return await service.fs.write(uri, content, ctx, edit_source="compile", wait=True)
+        return await service.fs.batch_write(
+            root_uri=TO,
+            operations=[{"uri": uri, "content": content}],
+            ctx=ctx,
+            defer_processing=True,
+        )
+
+    return write
+
+
 async def _run(service, ctx, *, write_page=None):
     compile_service = service.compile
     compile_service.configure_local_backend("http://127.0.0.1:1", "")
@@ -253,22 +270,177 @@ async def test_finish_accepts_async_reindex_before_completing_task(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["failed", "cancelled"])
-async def test_unsuccessful_compile_rolls_back_deferred_output(service, compile_task, status):
+async def test_unsuccessful_compile_preserves_ordinary_versions(
+    service, compile_task, compile_write, status
+):
     ctx, task = compile_task
+    await _write(service, f"{TO}/compile-only.md", "before", ctx)
     await service.compile.on_start(task)
-    await service.fs.batch_write(
-        root_uri=TO,
-        operations=[
-            {"uri": f"{TO}/page.md", "content": "changed"},
-            {"uri": f"{TO}/new.md", "content": "new"},
-        ],
-        ctx=ctx,
-        defer_processing=True,
-    )
+    for name in ("page.md", "ordinary-new.md"):
+        await service.fs.write(f"{TO}/{name}", "ordinary", ctx, edit_source="manual", wait=True)
+    for name in ("page.md", "ordinary-new.md", "compile-only.md", "new.md"):
+        await compile_write(ctx, f"{TO}/{name}", "compiled")
+    # Returning to start bytes must still restore the latest ordinary version.
+    await service.fs.write(f"{TO}/page.md", "ordinary latest", ctx, edit_source="manual", wait=True)
+    await compile_write(ctx, f"{TO}/page.md", "before")
+    await service.fs.write(f"{TO}/last.md", "ordinary last", ctx, wait=True)
     await service.compile.on_finish(task, ExternalTaskSnapshot(status=status))
-    assert await service.viking_fs.read_file(f"{TO}/page.md", ctx=ctx) == "before"
+    await service.compile.on_finish(task, ExternalTaskSnapshot(status=status))
+    for name in ("page.md", "ordinary-new.md"):
+        uri = f"{TO}/{name}"
+        expected = "ordinary latest" if name == "page.md" else "ordinary"
+        assert await service.viking_fs.read_file(uri, ctx=ctx) == expected
+        history = await service.compile.file_versions(uri, ctx, limit=10, before=None)
+        latest = history["versions"][0]
+        assert latest["source"] == "manual"
+        assert latest["provenance"]["source_roots"] == [uri]
+        assert (
+            await service.viking_fs.show(latest["snapshot_id"], path=uri, ctx=ctx)
+            == expected.encode()
+        )
+    assert await service.viking_fs.read_file(f"{TO}/compile-only.md", ctx=ctx) == "before"
+    assert await service.viking_fs.read_file(f"{TO}/last.md", ctx=ctx) == "ordinary last"
     assert not await service.viking_fs.exists(f"{TO}/new.md", ctx=ctx)
     service.reindex.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "edits,latest_source",
+    [
+        ([("manual", "A"), ("compile", "B")], "compile"),
+        ([("compile", "B"), ("manual", "A")], "manual"),
+        ([("manual", "A"), ("compile", "A")], "manual"),
+        ([("manual", "A"), ("compile", "before")], "compile"),
+        ([("compile", "B"), ("manual", "before")], "manual"),
+    ],
+)
+async def test_finish_compares_final_content(
+    service, compile_task, compile_write, edits, latest_source
+):
+    ctx, task = compile_task
+    await service.compile.on_start(task)
+    uri = f"{TO}/page.md"
+    for source, content in edits:
+        if source == "compile":
+            await compile_write(ctx, uri, content)
+        else:
+            await service.fs.write(uri, content, ctx, edit_source=source, wait=True)
+    before = await service.compile.file_versions(uri, ctx, limit=10, before=None)
+    assert [v["source"] for v in before["versions"]] == ["manual", "external"]
+    for _ in range(2):
+        await service.compile.on_finish(task, ExternalTaskSnapshot(status="completed"))
+    history = (await service.compile.file_versions(uri, ctx, limit=10, before=None))["versions"]
+    assert history[0]["source"] == latest_source
+    assert history[-2:] == before["versions"]
+    assert len(history) == (3 if latest_source == "compile" else 2)
+    final = edits[-1][1]
+    assert await service.viking_fs.read_file(uri, ctx=ctx) == final
+    assert (
+        await service.viking_fs.show(history[0]["snapshot_id"], path=uri, ctx=ctx) == final.encode()
+    )
+
+
+@pytest.mark.parametrize("edit_source", ["manual", "agent"])
+async def test_write_sources_before_first_compile(
+    service, compile_task, compile_write, monkeypatch, edit_source
+):
+    ctx, task = compile_task
+    uri = f"{TO}/nested/new.md"
+    commit = AsyncMock(wraps=service.compile.lifecycle.versions._commit)
+    monkeypatch.setattr(service.compile.lifecycle.versions, "_commit", commit)
+    await compile_write(ctx, uri, "compiled")
+    commit.assert_not_awaited()
+    assert await service.viking_fs.read_file(uri, ctx=ctx) == "compiled"
+    assert (await service.compile.file_versions(uri, ctx, limit=10, before=None))["versions"] == []
+    await service.fs.write(uri, "ordinary", ctx, edit_source=edit_source, wait=True)
+    commit.assert_awaited_once()
+    history = await service.compile.file_versions(uri, ctx, limit=10, before=None)
+    assert [v["source"] for v in history["versions"]] == [edit_source]
+    await service.compile.on_start(task)
+    await service.compile.on_finish(task, ExternalTaskSnapshot(status="completed"))
+    assert await service.compile.file_versions(uri, ctx, limit=10, before=None) == history
+
+
+@pytest.mark.parametrize("status", ["completed", "cancelled"])
+async def test_finish_defers_while_ordinary_version_is_registering(
+    service, compile_task, monkeypatch, status
+):
+    from openviking.storage.errors import ResourceBusyError
+
+    ctx, task = compile_task
+    await service.compile.on_start(task)
+    versions = service.compile.lifecycle.versions
+    append = versions.append
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def blocked_append(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await append(*args, **kwargs)
+
+    monkeypatch.setattr(versions, "append", blocked_append)
+    uri = f"{TO}/page.md"
+    writing = asyncio.create_task(service.fs.write(uri, "ordinary", ctx, wait=True))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        with pytest.raises(ResourceBusyError):
+            await service.compile.on_finish(task, ExternalTaskSnapshot(status=status))
+    finally:
+        release.set()
+        await writing
+    await service.compile.on_finish(task, ExternalTaskSnapshot(status=status))
+    history = await service.compile.file_versions(uri, ctx, limit=10, before=None)
+    assert [v["source"] for v in history["versions"]] == ["agent", "external"]
+    assert await service.viking_fs.read_file(uri, ctx=ctx) == "ordinary"
+
+
+@pytest.mark.parametrize(
+    "interrupt_at,status",
+    [
+        ("before_versions", "completed"),
+        ("after_versions", "completed"),
+        ("after_versions", "cancelled"),
+    ],
+)
+async def test_retry_does_not_publish_saved_snapshot_over_new_ordinary_version(
+    service, compile_task, compile_write, monkeypatch, interrupt_at, status
+):
+    from openviking.service.compile_targets import CompileLifecycle
+
+    ctx, task = compile_task
+    compile_only = f"{TO}/compile-only.md"
+    await _write(service, compile_only, "before", ctx)
+    await service.compile.on_start(task)
+    uri = f"{TO}/page.md"
+    await compile_write(ctx, uri, "compiled")
+    await compile_write(ctx, compile_only, "compiled")
+    versions = service.compile.lifecycle.versions
+    record_compile = versions.record_compile
+
+    async def interrupted(*args, **kwargs):
+        if interrupt_at == "after_versions":
+            await record_compile(*args, **kwargs)
+        raise OSError("interrupted")
+
+    monkeypatch.setattr(versions, "record_compile", interrupted)
+    with pytest.raises(OSError, match="interrupted"):
+        await service.compile.on_finish(task, ExternalTaskSnapshot(status="completed"))
+    await service.fs.write(uri, "ordinary", ctx, edit_source="manual", wait=True)
+    restarted = CompileLifecycle(service.compile.lifecycle.store, service.viking_fs)
+    await restarted.on_finish(task, ExternalTaskSnapshot(status=status))
+    history = await service.compile.file_versions(uri, ctx, limit=10, before=None)
+    expected = ["manual", "external"]
+    if interrupt_at == "after_versions" and status == "completed":
+        expected.insert(1, "compile")
+    assert [v["source"] for v in history["versions"]] == expected
+    assert await service.viking_fs.read_file(uri, ctx=ctx) == "ordinary"
+    assert await service.viking_fs.read_file(compile_only, ctx=ctx) == (
+        "compiled" if status == "completed" else "before"
+    )
+    index = await versions.load(
+        ctx.account_id, task.meta["request"]["compile"]["target_id"], compile_only
+    )
+    assert index["source_roots"] == [SRC]
 
 
 @pytest.mark.asyncio

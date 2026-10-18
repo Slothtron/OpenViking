@@ -1276,7 +1276,7 @@ class FSService:
         tags: Optional[List[str]] = None,
         tag_mode: str = "replace",
         acl: AclSpec | Dict[str, Any] | None = None,
-        edit_source: Literal["manual", "agent"] = "agent",
+        edit_source: Literal["manual", "agent", "compile"] = "agent",
         record_version: bool = True,
         commit_content: Optional[Callable[..., Awaitable[Any]]] = None,
     ) -> Dict[str, Any]:
@@ -1285,7 +1285,12 @@ class FSService:
         Internal restores supply ``commit_content`` to record their own version.
         """
         viking_fs = self._ensure_initialized()
-        if commit_content is None and record_version and self.compile_versions is not None:
+        if (
+            commit_content is None
+            and record_version
+            and edit_source != "compile"
+            and self.compile_versions is not None
+        ):
             commit_content = partial(
                 self.compile_versions.record_write, ctx=ctx, edit_source=edit_source
             )

@@ -2127,6 +2127,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_forwards_compile_edit_source() {
+        let (base_url, request_rx) = spawn_request_capture_server().await;
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
+        client
+            .write(
+                "viking://resources/wiki/page.md",
+                "compiled",
+                "replace",
+                false,
+                "vectors_only",
+                vec![],
+                "replace",
+                None,
+                "compile",
+            )
+            .await
+            .expect("Compile write should succeed");
+        let request = request_rx.await.expect("request should be captured");
+        assert!(request.starts_with("POST /api/v1/content/write "));
+        assert!(request.contains(r#""edit_source":"compile""#));
+        assert!(request.contains(r#""processing_mode":"vectors_only""#));
+    }
+
+    #[tokio::test]
     async fn add_resource_sends_parse_mode_through_args() {
         let (default_url, default_request_rx) = spawn_request_capture_server().await;
         let default_client = HttpClient::new(default_url, None, None, None, None, 5.0, false, None);

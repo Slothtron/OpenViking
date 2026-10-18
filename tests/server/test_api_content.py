@@ -127,7 +127,8 @@ async def test_batch_write_forwards_processing_mode_and_operation_metadata(monke
     assert list(operation["acl"]["entries"]) == []
 
 
-async def test_write_forwards_processing_mode_to_service(monkeypatch):
+@pytest.mark.parametrize("edit_source", ["manual", "agent", "compile"])
+async def test_write_forwards_processing_mode_to_service(monkeypatch, edit_source):
     seen = {}
 
     async def fake_write(**kwargs):
@@ -143,12 +144,14 @@ async def test_write_forwards_processing_mode_to_service(monkeypatch):
             uri="viking://resources/demo.md",
             content="updated",
             processing_mode="vectors_only",
+            edit_source=edit_source,
         ),
         ctx,
     )
 
     assert response["status"] == "ok"
     assert seen["processing_mode"] == "vectors_only"
+    assert seen["edit_source"] == edit_source
 
 
 async def test_write_forwards_tags_and_tag_mode_to_service(monkeypatch):
