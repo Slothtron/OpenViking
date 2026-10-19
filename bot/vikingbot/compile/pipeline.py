@@ -91,11 +91,7 @@ class Pipeline:
     ):
         self.client, self.limits, self.request = client, limits, request
         self.target, self.skill = request.to, skill
-        self.changes = (
-            {k: v for k, v in request.changes.items() if k != "candidate_output_scopes"}
-            if request.changes is not None
-            else None
-        )
+        self.changes = dict(request.changes) if request.changes is not None else None
         self.tools = {}
         self.tool_context = None
         self.skill_target = classify_uri(self.target).context_type == "skill"

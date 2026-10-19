@@ -4,7 +4,7 @@
 
 ``trigger_if_due`` owns the decision and submission under the target record
 lock. Backends only discover candidates: ``local`` scans each account's
-targets.json every minute; ``redis`` registers each target's next slot with the
+target_folders.json every minute; ``redis`` registers each target's next slot with the
 distributed ExpiryScheduler and also runs a slower compensation scan, because
 the record (not Redis) is the source of truth.
 """

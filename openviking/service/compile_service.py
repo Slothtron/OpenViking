@@ -399,6 +399,8 @@ class CompileService:
                 self.task_type, payload, private_payload, ctx, idempotency_key
             )
             if existing is not None:
+                if self._lifecycle is not None:
+                    await self._lifecycle.record_created(existing)
                 return existing
         endpoint = self._endpoint()
         if not endpoint.local and not str(connection.get("api_key") or "").strip():
@@ -410,9 +412,12 @@ class CompileService:
             payload = await self._lifecycle.prepare(
                 submitted, ctx, instruction_set=request._instruction_sent
             )
-        return await self._create_task(
+        task = await self._create_task(
             payload, submitted, private_payload, normalized, connection, ctx, idempotency_key
         )
+        if self._lifecycle is not None:
+            await self._lifecycle.record_created(task)
+        return task
 
     async def create_scheduled(
         self,
@@ -569,6 +574,10 @@ class CompileService:
             "next_run_at": next_run_at(dict(record)),
             "last_run": record["last_run"],
             "last_error": record["last_error"],
+            "content_updated_at": record.get("content_updated_at"),
+            "first_compile_created_at": record.get("first_compile_created_at"),
+            "compile_type": record.get("compile_type", "compile"),
+            "conflicts_num": record.get("conflicts_num", 0),
         }
 
     async def get_config(self, to: str, ctx: RequestContext) -> dict[str, Any]:
@@ -618,23 +627,34 @@ class CompileService:
                     "auto_update": item["auto_update"],
                     "update_schedule": item["update_schedule"],
                     "next_run_at": next_run_at(item),
+                    "content_updated_at": item.get("content_updated_at"),
+                    "first_compile_created_at": item.get("first_compile_created_at"),
+                    "compile_type": item.get("compile_type", "compile"),
+                    "conflicts_num": item.get("conflicts_num", 0),
                 }
             )
         return items
 
-    async def list_runs(
+    async def list_operations(
         self, to: str, ctx: RequestContext, *, limit: int, cursor: str | None
     ) -> dict[str, Any]:
+        """Return one target's newest operations, continuing after the operation-ID cursor."""
         record = await self._target(to, ctx)
-        runs = await self._require_lifecycle().store.list_runs(ctx.account_id, record["id"])
+        operations = await self._require_lifecycle().store.list_operations(
+            ctx.account_id, record["id"]
+        )
         if cursor:
-            ids = [run["task_id"] for run in runs]
-            runs = runs[ids.index(cursor) + 1 :] if cursor in ids else []
-        page = runs[:limit]
+            ids = [operation["operation_id"] for operation in operations]
+            operations = operations[ids.index(cursor) + 1 :] if cursor in ids else []
+        page = operations[:limit]
         public = [
             {
-                key: run.get(key)
+                key: operation.get(key)
                 for key in (
+                    "operation_id",
+                    "operation_type",
+                    "actor",
+                    "created_at",
                     "task_id",
                     "trigger",
                     "status",
@@ -649,14 +669,16 @@ class CompileService:
                 )
             }
             | {
+                "conflicts_num": operation.get("conflicts_num", 0),
                 "changes": {
-                    key: (run.get("changes") or {}).get(key) for key in ("summary", "scope_count")
-                }
+                    key: (operation.get("changes") or {}).get(key)
+                    for key in ("summary", "scope_count")
+                },
             }
-            for run in page
+            for operation in page
         ]
-        next_cursor = page[-1]["task_id"] if len(runs) > limit else None
-        return {"runs": public, "next_cursor": next_cursor}
+        next_cursor = page[-1]["operation_id"] if len(operations) > limit else None
+        return {"operations": public, "next_cursor": next_cursor}
 
     async def file_versions(
         self, uri: str, ctx: RequestContext, *, limit: int, before: str | None
@@ -679,6 +701,7 @@ class CompileService:
                 uri,
                 content.decode("utf-8"),
                 ctx,
+                edit_source="compile",
                 record_version=False,
                 commit_content=commit_content,
             )

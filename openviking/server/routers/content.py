@@ -87,6 +87,7 @@ class BatchWriteRequest(BaseModel):
     # Save content without semantic or vector work; the caller schedules processing.
     defer_processing: bool = False
     processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE
+    edit_source: Literal["manual", "agent", "compile"] = "compile"
 
 
 class SetTagsRequest(BaseModel):
@@ -304,6 +305,7 @@ async def batch_write(
             skip_conflicts=request.skip_conflicts,
             defer_processing=request.defer_processing,
             processing_mode=request.processing_mode,
+            edit_source=request.edit_source,
         ),
     )
     return Response(

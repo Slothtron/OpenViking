@@ -1285,14 +1285,12 @@ class FSService:
         Internal restores supply ``commit_content`` to record their own version.
         """
         viking_fs = self._ensure_initialized()
-        if (
-            commit_content is None
-            and record_version
-            and edit_source != "compile"
-            and self.compile_versions is not None
-        ):
+        if commit_content is None and self.compile_versions is not None:
             commit_content = partial(
-                self.compile_versions.record_write, ctx=ctx, edit_source=edit_source
+                self.compile_versions.record_write,
+                ctx=ctx,
+                edit_source=edit_source,
+                record_version=record_version and edit_source != "compile",
             )
         coordinator = ContentWriteCoordinator(
             viking_fs=viking_fs,
@@ -1300,7 +1298,8 @@ class FSService:
             privacy_sanitizer=self._privacy_sanitizer,
             commit_content=commit_content,
         )
-        result = await coordinator.write(
+        write = partial(
+            coordinator.write,
             uri=uri,
             content=content,
             ctx=ctx,
@@ -1311,7 +1310,11 @@ class FSService:
             tag_mode=tag_mode,
             acl=acl,
         )
-        return result
+        if self.compile_versions is None or edit_source == "compile":
+            return await write()
+        return await self.compile_versions.record_operation(
+            [uri], ctx, f"{edit_source}_revise", {"mode": mode}, write
+        )
 
     async def batch_write(
         self,
@@ -1323,6 +1326,7 @@ class FSService:
         skip_conflicts: bool = False,
         defer_processing: bool = False,
         processing_mode: str = "semantic_and_vectors",
+        edit_source: Literal["manual", "agent", "compile"] = "compile",
     ) -> Dict[str, Any]:
         """Apply multiple file writes and aggregate downstream refresh."""
         viking_fs = self._ensure_initialized()
@@ -1331,12 +1335,18 @@ class FSService:
             vikingdb=self._vikingdb,
             privacy_sanitizer=self._privacy_sanitizer,
             commit_content=(
-                partial(self.compile_versions.record_write, ctx=ctx, edit_source="agent")
+                partial(
+                    self.compile_versions.record_write,
+                    ctx=ctx,
+                    edit_source=edit_source,
+                    record_version=False,
+                )
                 if self.compile_versions is not None
                 else None
             ),
         )
-        result = await coordinator.batch_write(
+        write = partial(
+            coordinator.batch_write,
             root_uri=root_uri,
             operations=operations,
             ctx=ctx,
@@ -1345,7 +1355,15 @@ class FSService:
             defer_processing=defer_processing,
             processing_mode=processing_mode,
         )
-        return result
+        if self.compile_versions is None or edit_source == "compile":
+            return await write()
+        return await self.compile_versions.record_operation(
+            [operation["uri"] for operation in operations],
+            ctx,
+            f"{edit_source}_revise",
+            {"batch": True},
+            write,
+        )
 
     async def set_tags(
         self,
@@ -1427,7 +1445,8 @@ class FSService:
     ) -> Dict[str, Any]:
         """Forward to VikingFS.restore. See viking_fs.restore for semantics."""
         viking_fs = self._ensure_initialized()
-        return await viking_fs.restore(
+        restore = partial(
+            viking_fs.restore,
             project_dir=project_dir,
             source_commit=source_commit,
             branch=branch,
@@ -1436,6 +1455,22 @@ class FSService:
             author_name=author_name,
             author_email=author_email,
             ctx=ctx,
+        )
+        if self.compile_versions is None or dry_run:
+            return await restore()
+        return await self.compile_versions.record_operation(
+            [
+                viking_fs._tree_path_to_uri(
+                    viking_fs._uri_to_tree_path(project_dir, ctx=ctx)
+                ).rstrip("/")
+                if project_dir
+                else "viking://"
+            ],
+            ctx,
+            "restore",
+            {"source_commit": source_commit, "branch": branch},
+            restore,
+            recursive=True,
         )
 
     async def show(

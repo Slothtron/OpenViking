@@ -537,6 +537,8 @@ With `dry_run=true`, only the planned diff is returned and nothing is written. D
 
 Call `GET /api/v1/snapshot/versions?uri=<file URI>` to obtain `current_version` and the version history before submitting a restore:
 
+The response's `total` counts all retained, queryable versions before applying `limit` or `before_version`; use `next_before_version` to load older versions.
+
 ```bash
 curl -X POST "http://localhost:1933/api/v1/snapshot/restore" \
   -H "Content-Type: application/json" \
@@ -548,7 +550,7 @@ curl -X POST "http://localhost:1933/api/v1/snapshot/restore" \
   }'
 ```
 
-When v1 differs from the current content, restoring creates v3 with v1's content and preserves the history of v1 and v2. The response contains `version_id: "v3"` and `restored_from: "v1"`. Identical content returns `result: "noop"` without creating a version.
+When v1 differs from the current content, restoring creates v3 with v1's content and preserves the history of v1 and v2. The response contains `version_id: "v3"` and `meta.restored_from: "v1"`. Identical content returns `result: "noop"` and `meta.restored_from: null` without creating a version.
 
 Only the specified file is restored; related Wiki pages and index content retain their current content. A running Compile on the target returns `409 CONFLICT` with `error.details.resource: "COMPILE_RUNNING"`. This mode does not provide a `dry_run` preview; directory restore preview options do not apply to single-file restore.
 

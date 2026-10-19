@@ -11,6 +11,7 @@ import hashlib
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from openviking.core.context import ContextLevel
@@ -551,16 +552,16 @@ class ContentWriteCoordinator:
                 try:
                     prepared = prepared_resources.get(uri)
                     if prepared is not None:
-                        await execute_content_tree_actions(
+                        write_content = partial(
+                            execute_content_tree_actions,
                             prepared.plan.content_tree_actions,
                             store=prepared.store,
                             artifact_ref=prepared.artifact_ref,
                             target=prepared.target,
                         )
-                        final_content = prepared.final_bytes
-                        committed_resource_plans.append(prepared)
                     else:
-                        final_content = await self._write_in_place(
+                        write_content = partial(
+                            self._write_in_place,
                             uri,
                             operation["content"],
                             mode=write_mode,
@@ -568,6 +569,10 @@ class ContentWriteCoordinator:
                             lease_ref=lease,
                             is_new_file=not existed,
                         )
+                    final_content = await self._commit_content([uri], lease, write_content)
+                    if prepared is not None:
+                        final_content = prepared.final_bytes
+                        committed_resource_plans.append(prepared)
                     if context_type_for_uri(uri) in {
                         "resource",
                         "skill",

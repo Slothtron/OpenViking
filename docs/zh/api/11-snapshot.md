@@ -537,6 +537,8 @@ ov snapshot restore 3f2a1b9c viking://resources/my_project -m "restore to v1" -o
 
 先调用 `GET /api/v1/snapshot/versions?uri=<文件 URI>` 获取 `current_version` 和历史版本列表，再提交恢复请求：
 
+响应中的 `total` 表示当前保留的可查询版本总数，不受 `limit`、`before_version` 影响；`next_before_version` 用于继续加载更旧版本。
+
 ```bash
 curl -X POST "http://localhost:1933/api/v1/snapshot/restore" \
   -H "Content-Type: application/json" \
@@ -548,7 +550,7 @@ curl -X POST "http://localhost:1933/api/v1/snapshot/restore" \
   }'
 ```
 
-当 v1 与当前内容不同时，恢复会生成新版本 v3，内容取自 v1；v1、v2 的历史记录保留。响应中的 `version_id` 为 `v3`，`restored_from` 为 `v1`。内容相同时返回 `result: "noop"`，不新增版本。
+当 v1 与当前内容不同时，恢复会生成新版本 v3，内容取自 v1；v1、v2 的历史记录保留。响应中的 `version_id` 为 `v3`，`meta.restored_from` 为 `v1`。内容相同时返回 `result: "noop"`、`meta.restored_from: null`，不新增版本。
 
 仅指定文件被恢复；相关 Wiki 页面和索引正文保持原内容。目标存在运行中的 Compile 时，返回 `409 CONFLICT`，`error.details.resource` 为 `COMPILE_RUNNING`。此模式不提供 `dry_run` 预演；目录恢复的预演参数不适用于单文件恢复。
 

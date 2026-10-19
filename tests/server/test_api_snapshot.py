@@ -847,7 +847,11 @@ async def test_restore_file_version_fields(snapshot_router_client, monkeypatch):
     from openviking.server.routers import snapshot
 
     uri = "viking://resources/wiki/page.md"
-    result = {"uri": uri, "version_id": "v3", "restored_from": "v1"}
+    result = {
+        "uri": uri,
+        "version_id": "v3",
+        "meta": {"task_id": None, "restored_from": "v1", "after_compile_snapshot": False},
+    }
     restore = AsyncMock(return_value=result)
     service = SimpleNamespace(compile=SimpleNamespace(restore_file_version=restore))
     monkeypatch.setattr(snapshot, "get_service", lambda: service)
