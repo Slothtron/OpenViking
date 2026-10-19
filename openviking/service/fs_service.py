@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal,
 
 from openviking.core.context import ContextLevel
 from openviking.core.namespace import (
+    canonical_session_root,
     classify_uri,
     context_type_for_uri,
     is_session_uri,
@@ -21,6 +22,7 @@ from openviking.core.namespace import (
 )
 from openviking.privacy.sanitizer import PrivacySanitizer
 from openviking.privacy.service import UserPrivacyConfigService
+from openviking.privacy.session_restore import get_session_id_from_uri, restore_session_read
 from openviking.privacy.skill_restore import get_skill_name_from_uri, restore_skill_content
 from openviking.resource.uri_mutation_coordinator import UriMutationCoordinator
 from openviking.resource.watch_storage import is_watch_task_control_uri
@@ -1094,15 +1096,24 @@ class FSService:
             legacy_uri = validate_safe_viking_uri_path(resolved_uri.replace("%20", " "))
             content = await viking_fs.read_file(legacy_uri, ctx=ctx)
             resolved_uri = legacy_uri
-        skill_name = get_skill_name_from_uri(resolved_uri)
-        if skill_name and self._privacy_config_service:
-            current = await self._privacy_config_service.get_current(
-                ctx=ctx,
-                category="skill",
-                target_key=skill_name,
-            )
-            if current:
-                content = restore_skill_content(content, skill_name, current.values)
+        if self._privacy_config_service is not None:
+            skill_name = get_skill_name_from_uri(resolved_uri)
+            session_id = get_session_id_from_uri(resolved_uri, canonical_session_root(ctx))
+            if skill_name is not None:
+                current = await self._privacy_config_service.get_current(
+                    ctx=ctx,
+                    category="skill",
+                    target_key=skill_name,
+                )
+                if current:
+                    content = restore_skill_content(content, skill_name, current.values)
+            elif session_id is not None:
+                content = await restore_session_read(
+                    self._privacy_config_service,
+                    content,
+                    ctx,
+                    jsonl=resolved_uri.endswith("/messages.jsonl"),
+                )
 
         if offset == 0 and limit == -1:
             return content

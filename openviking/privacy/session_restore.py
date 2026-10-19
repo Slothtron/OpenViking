@@ -1,26 +1,26 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Restore Session privacy only at the public file-read boundary."""
+"""Restore user-owned references only at the public Session content boundary."""
 
 import json
 import re
 from typing import Any
 
-from openviking.core.namespace import canonical_session_root
+from openviking.privacy.reference import parse_privacy_field_reference
 from openviking.privacy.service import UserPrivacyConfigService
 from openviking.server.identity import RequestContext
-from openviking_cli.exceptions import InvalidArgumentError
+from openviking_cli.exceptions import InvalidArgumentError, NotFoundError, ResourceExhaustedError
 
-# Text fields that may contain placeholders, keyed by Part type.
+_REFERENCE = re.compile(r"\{\{[ \t]*ov_privacy:[^{}\r\n]+\}\}")
 _TEXT_FIELDS = {
     "text": ("text",),
     "context": ("abstract",),
     "tool": ("tool_output", "tool_output_externalization_error"),
 }
+MAX_RESTORE_TARGETS = 1024
 
 
 def get_session_id_from_uri(uri: str, session_root: str) -> str | None:
-    """Return the Session ID for message and tool-output files that may be restored."""
     prefix = session_root + "/"
     if not uri.startswith(prefix):
         return None
@@ -36,41 +36,30 @@ def get_session_id_from_uri(uri: str, session_root: str) -> str | None:
     return None
 
 
-def restore_session_content(
-    content: str, session_id: str, values: dict[str, Any], *, jsonl: bool = False
-) -> str:
-    """Replace this Session's placeholders with current values.
-
-    Unknown keys keep their placeholder. JSONL is parsed per record so restored
-    quotes or newlines cannot break the message file format.
-    """
-    pattern = re.compile(r"\{\{ov_privacy:session:" + re.escape(session_id) + r":([^}:]+)\}\}")
-
+def _restore_content(content: str, resolved: dict[str, Any], *, jsonl: bool) -> str:
     def text(value: str) -> str:
-        # One pass: values containing other references are never expanded.
-        return pattern.sub(
-            lambda match: str(values[match[1]]) if match[1] in values else match[0], value
+        return _REFERENCE.sub(
+            lambda match: str(resolved[match[0]]) if match[0] in resolved else match[0], value
         )
 
-    def structured(value: Any) -> Any:
+    def structured(value):
         if isinstance(value, str):
-            match = pattern.fullmatch(value)
-            if match and match[1] in values:
-                return values[match[1]]
+            if value in resolved:
+                return resolved[value]
             return text(value)
         if isinstance(value, list):
             return [structured(item) for item in value]
         if isinstance(value, dict):
             result = {}
             for key, item in value.items():
-                restored_key = text(key)
-                if restored_key in result:
+                clean_key = text(key)
+                if clean_key in result:
                     raise InvalidArgumentError("Session privacy restored object key collision")
-                result[restored_key] = structured(item)
+                result[clean_key] = structured(item)
             return result
         return value
 
-    if not pattern.search(content):
+    if not resolved:
         return content
     if not jsonl:
         return text(content)
@@ -94,20 +83,35 @@ def restore_session_content(
 
 
 async def restore_session_read(
-    privacy: UserPrivacyConfigService | None, uri: str, content: str, ctx: RequestContext
+    privacy: UserPrivacyConfigService,
+    content: str,
+    ctx: RequestContext,
+    *,
+    jsonl: bool = False,
 ) -> str:
-    """Resolve current values after visible-read sanitization, without rewriting disk."""
-    session_root = canonical_session_root(ctx)
-    session_id = get_session_id_from_uri(uri, session_root)
-    if (
-        privacy is None
-        or session_id is None
-        or f"{{{{ov_privacy:session:{session_id}:" not in content
-    ):
-        return content
-    current = await privacy.get_current(ctx, "session", session_id)
-    if current is None:
-        return content
-    return restore_session_content(
-        content, session_id, current.values, jsonl=uri.endswith("/messages.jsonl")
-    )
+    """Resolve user-owned references from current values without rewriting disk."""
+    selectors = {}
+    targets = {}
+    for match in _REFERENCE.finditer(content):
+        selector = match[0]
+        reference = parse_privacy_field_reference(selector)
+        if reference is None or reference.owner_user_id != ctx.user.user_id:
+            continue
+        target = (reference.category, reference.target_key)
+        if target not in targets:
+            if len(targets) >= MAX_RESTORE_TARGETS:
+                raise ResourceExhaustedError("Session privacy reference target limit exceeded")
+            targets[target] = None
+        selectors[selector] = (target, reference.field)
+    for category, target_key in targets:
+        try:
+            current = await privacy.get_current(ctx, category, target_key)
+        except (NotFoundError, FileNotFoundError, InvalidArgumentError):
+            current = None
+        targets[(category, target_key)] = current.values if current else {}
+    resolved = {
+        selector: targets[target][field]
+        for selector, (target, field) in selectors.items()
+        if field in targets[target]
+    }
+    return _restore_content(content, resolved, jsonl=jsonl)
