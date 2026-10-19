@@ -9,7 +9,6 @@ from secrets import token_urlsafe
 from typing import Any, TypeVar
 
 from openviking.message.part import ContextPart, ImagePart, Part, TextPart, ToolPart
-from openviking.privacy.reference import build_privacy_field_reference
 from openviking.privacy.rules import (
     MAX_MATCHES,
     MAX_TEXT_CHARS,
@@ -41,13 +40,14 @@ async def extract_and_store_session_privacy(
     sanitizer: PrivacySanitizer | None,
 ) -> list[dict]:
     """Extract on copies, persist discoveries, then protect remaining registered values."""
-    matcher = await sanitizer.prepare_matcher(ctx) if sanitizer else _no_matches
+    matcher = (
+        await sanitizer.prepare_matcher(ctx, prefer_credentials=True) if sanitizer else _no_matches
+    )
     for _ in range(MAX_FIELD_ID_ATTEMPTS):
         sanitized, added = await asyncio.to_thread(
             extract_session_privacy_values,
             session_id,
             messages_spec,
-            owner_user_id=ctx.user.user_id,
             match_registered=matcher,
         )
         if not added:
@@ -67,7 +67,9 @@ async def extract_and_store_session_privacy(
     else:
         raise ResourceExhaustedError("Could not allocate unique Session privacy field IDs")
     # Refresh the matcher to include newly saved values.
-    matcher = await sanitizer.prepare_matcher(ctx) if sanitizer else _no_matches
+    matcher = (
+        await sanitizer.prepare_matcher(ctx, prefer_credentials=True) if sanitizer else _no_matches
+    )
     rewriter = _SessionReferenceRewriter(matcher)
     return await asyncio.to_thread(rewriter.transform_messages, sanitized)
 
@@ -76,16 +78,15 @@ def extract_session_privacy_values(
     session_id: str,
     messages_spec: list[dict],
     *,
-    owner_user_id: str = "default",
     match_registered: _Matcher | None = None,
 ) -> tuple[list[dict], dict[str, Any]]:
     """Return protected copies and discoveries without modifying caller-owned data."""
-    extraction = _SessionExtraction(session_id, owner_user_id, match_registered or _no_matches)
+    extraction = _SessionExtraction(session_id, match_registered or _no_matches)
     return extraction.transform_messages(messages_spec), extraction.values
 
 
-def build_session_placeholder(session_id: str, key: str, owner_user_id: str = "default") -> str:
-    return build_privacy_field_reference(owner_user_id, "session", session_id, key)
+def build_session_placeholder(session_id: str, key: str) -> str:
+    return f"{{{{ov_privacy:session:{session_id}:{key}}}}}"
 
 
 @dataclass
@@ -186,10 +187,9 @@ class _SessionExtraction(_PayloadTransformer):
 
     budget: _ExtractionBudget
 
-    def __init__(self, session_id: str, owner_user_id: str, value_matcher: _Matcher):
+    def __init__(self, session_id: str, value_matcher: _Matcher):
         super().__init__(_ExtractionBudget())
         self.session_id = session_id
-        self.owner_user_id = owner_user_id
         self.value_matcher = value_matcher
         self.values: dict[str, Any] = {}
         # Same input budget, with identity handlers: validate and copy, never extract.
@@ -221,7 +221,7 @@ class _SessionExtraction(_PayloadTransformer):
             key = token_urlsafe(6)
             if key not in self.values:
                 self.values[key] = value
-                return build_session_placeholder(self.session_id, key, self.owner_user_id)
+                return build_session_placeholder(self.session_id, key)
         raise ResourceExhaustedError("Could not allocate unique Session privacy field IDs")
 
     def transform_text(self, text: _Text) -> _Text:

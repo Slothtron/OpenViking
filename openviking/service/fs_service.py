@@ -1112,6 +1112,7 @@ class FSService:
                     self._privacy_config_service,
                     content,
                     ctx,
+                    session_id=session_id,
                     jsonl=resolved_uri.endswith("/messages.jsonl"),
                 )
 
@@ -1156,7 +1157,15 @@ class FSService:
             content = visible_content(content, uri=resolved_uri)
         if self._privacy_sanitizer is not None:
             content = (
-                await self._privacy_sanitizer.sanitize(content, ctx=ctx, uri=resolved_uri)
+                await self._privacy_sanitizer.sanitize(
+                    content,
+                    ctx=ctx,
+                    uri=resolved_uri,
+                    prefer_credentials=(
+                        get_session_id_from_uri(resolved_uri, canonical_session_root(ctx))
+                        is not None
+                    ),
+                )
             ).content
         if offset == 0 and limit == -1:
             return content

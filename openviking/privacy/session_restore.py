@@ -12,6 +12,9 @@ from openviking.server.identity import RequestContext
 from openviking_cli.exceptions import InvalidArgumentError, NotFoundError, ResourceExhaustedError
 
 _REFERENCE = re.compile(r"\{\{[ \t]*ov_privacy:[^{}\r\n]+\}\}")
+_SESSION_REFERENCE = re.compile(
+    r"\{\{[ \t]*ov_privacy:session:([A-Za-z0-9_.@-]+):([A-Za-z0-9_-]{8})[ \t]*\}\}"
+)
 _TEXT_FIELDS = {
     "text": ("text",),
     "context": ("abstract",),
@@ -87,6 +90,7 @@ async def restore_session_read(
     content: str,
     ctx: RequestContext,
     *,
+    session_id: str,
     jsonl: bool = False,
 ) -> str:
     """Resolve user-owned references from current values without rewriting disk."""
@@ -94,15 +98,21 @@ async def restore_session_read(
     targets = {}
     for match in _REFERENCE.finditer(content):
         selector = match[0]
-        reference = parse_privacy_field_reference(selector)
-        if reference is None or reference.owner_user_id != ctx.user.user_id:
-            continue
-        target = (reference.category, reference.target_key)
+        short = _SESSION_REFERENCE.fullmatch(selector)
+        if short is not None:
+            if short[1] != session_id:
+                continue
+            target, field = ("session", session_id), short[2]
+        else:
+            reference = parse_privacy_field_reference(selector)
+            if reference is None or reference.owner_user_id != ctx.user.user_id:
+                continue
+            target, field = (reference.category, reference.target_key), reference.field
         if target not in targets:
             if len(targets) >= MAX_RESTORE_TARGETS:
                 raise ResourceExhaustedError("Session privacy reference target limit exceeded")
             targets[target] = None
-        selectors[selector] = (target, reference.field)
+        selectors[selector] = (target, field)
     for category, target_key in targets:
         try:
             current = await privacy.get_current(ctx, category, target_key)

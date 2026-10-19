@@ -146,11 +146,12 @@ Session.add_messages_async
 
 #### Key Points
 
-1. **Extraction source**: fixed rules for common credential patterns, without model calls. Supported forms include `password=...`, `api_key=...`, and `Authorization: Bearer ...`.
+1. **Extraction source**: fixed rules identify sensitive values without model calls; the results are used as privacy key-value pairs.
 2. **Coverage**: TextPart text, ContextPart abstracts, and ToolPart input and output. Values under sensitive tool input keys are stored and masked as a whole.
-3. **Content replacement**: registered values reuse their references. Newly extracted values are saved in the current Session's privacy config, and the content uses canonical references that include the owner, for example:
-   - `{{ov_privacy:alice:viking://~/privacy/session/<sessionID>#/values/<randomID>}}`
-4. **Persisted content**: privacy values are saved before writing placeholderized messages; unmatched content remains unchanged. Extraction or persistence failures reject the message batch.
+3. **Content replacement**: newly extracted sensitive spans in the original content are replaced with placeholders:
+   - <code>&#123;&#123;ov_privacy:session:&#123;session_id&#125;:&#123;field_name&#125;&#125;&#125;</code>
+   - If a sensitive span matches registered personal credentials (`credential`), prefer the uniquely matching field's placeholder, for example `{{ov_privacy:alice:viking://~/privacy/credential/github#/values/pat}}`.
+4. **Persisted content**: matched spans are saved as placeholders; unmatched content remains unchanged. Newly extracted privacy values are saved in the current Session's config.
 
 ---
 
@@ -176,9 +177,19 @@ Restoration is supported for these files under the current user's Session direct
 
 #### restore Rules
 
-1. **Reference belongs to the current user and its value exists**: replace it with the referenced field's current value. Whole-value references in tool input restore the original JSON type.
+`restore_session_read` behavior:
 
-2. **Reference belongs to another user or its value is missing**: leave the reference unchanged.
+1. **Placeholder exists in content and privacy value exists**
+
+   -> Replace directly with the corresponding value. Whole-value placeholders in tool input restore the original JSON type.
+
+2. **Placeholder exists in content but privacy value is missing**
+
+   -> Keep the placeholder unchanged.
+
+3. **Placeholder in content refers to another user, or uses `{{ov_privacy:session:...}}` for another Session**
+
+   -> Keep the placeholder unchanged.
 
 > Restoration affects only the read result, without modifying stored files. References follow the active config: rotating a field or activating another version also changes the value used on the next read of historical messages.
 

@@ -88,9 +88,9 @@ async def test_extract_and_restore_complete_messages(privacy, request_context):
     for secret in ["中文密码", "abstract-secret", "another-secret", "hello world", "error-secret"]:
         assert secret not in clean
     privacy.get_current.return_value = SimpleNamespace(values=values)
-    assert await restore_session_read(privacy, clean, request_context, jsonl=True) == message_jsonl(
-        before
-    )
+    assert await restore_session_read(
+        privacy, clean, request_context, session_id="demo", jsonl=True
+    ) == message_jsonl(before)
     specs[1]["parts"][0].tool_input["credentials"]["nested"].append("changed")
     assert "changed" not in json.dumps(list(values.values()))
 
@@ -105,7 +105,7 @@ async def test_batch_field_id_collision_preserves_both_values(
     assert sorted(values.values()) == ["first", "second"]
     privacy.get_current.return_value = SimpleNamespace(values=values)
     assert await restore_session_read(
-        privacy, message_jsonl(protected), request_context, jsonl=True
+        privacy, message_jsonl(protected), request_context, session_id="demo", jsonl=True
     ) == message_jsonl(specs)
 
 
@@ -125,7 +125,7 @@ async def test_sensitive_field_names_do_not_leak_into_references(privacy, reques
     assert key not in message_jsonl(sanitized)
     privacy.get_current.return_value = SimpleNamespace(values=values)
     assert await restore_session_read(
-        privacy, message_jsonl(sanitized), request_context, jsonl=True
+        privacy, message_jsonl(sanitized), request_context, session_id="demo", jsonl=True
     ) == message_jsonl(specs)
 
 
@@ -194,4 +194,6 @@ async def test_invalid_message_jsonl_is_rejected(privacy, request_context):
     reference = build_privacy_field_reference("default", "session", "demo", "one")
     privacy.get_current.return_value = SimpleNamespace(values={"one": "secret"})
     with pytest.raises(InvalidArgumentError):
-        await restore_session_read(privacy, f"not json {reference}", request_context, jsonl=True)
+        await restore_session_read(
+            privacy, f"not json {reference}", request_context, session_id="demo", jsonl=True
+        )

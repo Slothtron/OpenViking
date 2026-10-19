@@ -272,3 +272,51 @@ async def test_prepared_matcher_rejects_unpaired_surrogates():
 
     with pytest.raises(UnicodeEncodeError):
         find("invalid \ud800")
+
+
+@pytest.mark.parametrize(
+    "credentials,ordinary,expected",
+    [
+        (1, 2, ("credential", "target-0")),
+        (2, 1, None),
+        (0, 2, None),
+    ],
+)
+async def test_credential_preference_selects_only_an_unambiguous_field(
+    credentials, ordinary, expected
+):
+    configs = {
+        category: {f"target-{i}": {"key": "shared-secret"} for i in range(count)}
+        for category, count in [("credential", credentials), ("session", ordinary)]
+    }
+    sanitizer = PrivacySanitizer(_PrivacyCatalog(configs))
+    find = await sanitizer.prepare_matcher(_ctx(), prefer_credentials=True)
+    if expected is None:
+        with pytest.raises(InvalidArgumentError, match="multiple fields"):
+            find("shared-secret")
+    else:
+        assert [hit.reference for hit in find("shared-secret")] == [
+            build_privacy_field_reference("alice", *expected, "key")
+        ]
+
+
+async def test_matcher_cache_separates_policies_and_refreshes_both_after_rotation():
+    catalog = _PrivacyCatalog(
+        {
+            "credential": {"managed": {"key": "shared-secret"}},
+            "session": {"captured": {"key": "shared-secret"}},
+        }
+    )
+    sanitizer = PrivacySanitizer(catalog)
+    credential = build_privacy_field_reference("alice", "credential", "managed", "key")
+    captured = build_privacy_field_reference("alice", "session", "captured", "key")
+    for preferred in [False, True] * 2:
+        result = await sanitizer.sanitize("shared-secret", ctx=_ctx(), prefer_credentials=preferred)
+        assert result.content == (credential if preferred else "{{ov_privacy:ambiguous}}")
+    catalog.configs["credential"]["managed"]["key"] = "rotated-secret"
+    catalog.revision += 1
+    for preferred in [False, True]:
+        result = await sanitizer.sanitize(
+            "shared-secret rotated-secret", ctx=_ctx(), prefer_credentials=preferred
+        )
+        assert result.content == f"{captured} {credential}"
