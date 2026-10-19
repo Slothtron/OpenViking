@@ -135,7 +135,11 @@ async def run(runtime: Pipeline, references: list[str]) -> RenderedBundle:
         origins[path] = origin
         relocations[origin] = path if origin not in relocations else None
         source_uris[path] = sorted(
-            {runtime.evidence[ref]["uri"] for ref in artifact["source_refs"]}
+            {
+                runtime.evidence[ref]["uri"]
+                for ref in artifact["source_refs"]
+                if runtime.evidence[ref].get("change_type") != "deleted"
+            }
         )
         outputs[path] = {"source_refs": artifact["source_refs"]}
     existing = {}
@@ -354,7 +358,9 @@ async def run(runtime: Pipeline, references: list[str]) -> RenderedBundle:
         review_prompt += (
             "\nThis is an incremental update: only modify content affected by the current inputs, "
             "preserve all other existing content, and do not treat information absent from these "
-            "inputs as unsupported or obsolete.\n"
+            "inputs as unsupported or obsolete. Source entries marked change_type=deleted are "
+            "deletion notices, not original text: their IDs may support removing or revising "
+            "content derived from that source, but not adding new facts.\n"
         )
     original_finalized = deepcopy(finalized)
     try:

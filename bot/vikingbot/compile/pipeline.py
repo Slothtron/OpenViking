@@ -454,19 +454,19 @@ class Pipeline:
         }
 
     async def seed(self, batches) -> list[Record]:
-        """Write unique source ranges with bounded concurrency, retaining their input order."""
+        """Seed source ranges and explicit deletion notices with stable, traceable input IDs."""
         result = []
         pending = []
         seen = set(self.records)
 
         async def write_source(item):
             """Atomically write one (ID, metadata, range); return its record and evidence."""
-            record_id, metadata, part = item
+            record_id, metadata, text, context = item
             await self.files.put(
-                f"sources/{record_id}", {**metadata, "text": part.content, "context": part.context}
+                f"sources/{record_id}", {**metadata, "text": text, "context": context}
             )
             return Record(
-                record_id, f"sources/{record_id}", [record_id], part.uri, {}, []
+                record_id, f"sources/{record_id}", [record_id], metadata["uri"], {}, []
             ), metadata
 
         async def flush():
@@ -502,11 +502,46 @@ class Pipeline:
                 if record_id in seen:
                     continue
                 seen.add(record_id)
-                pending.append((record_id, metadata, part))
+                pending.append((record_id, metadata, part.content, part.context))
                 if len(pending) >= self.limits.source_concurrency:
                     await flush()
         if pending:
             await flush()
+        deleted = {
+            scope["uri"]
+            for scope in (self.changes or {}).get("scopes") or []
+            if scope.get("change_type") == "deleted" and not scope.get("recursive")
+        }
+        if deleted:
+            manifest = await self.files.get("inputs") or {}
+            for uri in sorted(deleted):
+                text = (
+                    "Source deletion notice: this source was deleted. Remove or revise only "
+                    "content derived from it; preserve other sources and manual edits. "
+                    "This notice is not the deleted source body or evidence for new facts."
+                )
+                metadata = {
+                    "uri": uri,
+                    "change_type": "deleted",
+                    "hash": content_hash(text),
+                    "start_char": 0,
+                    "end_char": len(text),
+                    "start_line": 1,
+                    "end_line": 1,
+                    "continues_before": False,
+                    "continues_after": False,
+                }
+                record_id = digest(metadata)[:24]
+                if record_id in seen:
+                    continue
+                seen.add(record_id)
+                manifest.setdefault(uri, "pending")
+                pending.append((record_id, metadata, text, ""))
+                if len(pending) >= self.limits.source_concurrency:
+                    await flush()
+            if pending:
+                await flush()
+            await self.files.put("inputs", manifest)
         return result
 
     def register(self, record: Record) -> None:

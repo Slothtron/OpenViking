@@ -123,3 +123,59 @@ async def test_direct_reads_stop_repetition_but_allow_progress(case):
             await result
     assert provider.chat.await_count == (len(offsets) + 1 if case == "progress" else 4)
     assert provider.chat.await_args.kwargs["thinking"] is False
+
+
+@pytest.mark.parametrize("case", ["absent", "empty", "null", "plain", "rescan", "delete", "mixed"])
+async def test_deleted_sources_keep_valid_input_lineage(case):
+    """Deletion updates retain checked IDs; absent changes and rescans invent no deletions."""
+    from vikingbot.compile import file_ops
+    from vikingbot.compile.ops.common import payload
+    from vikingbot.compile.pipeline import Pipeline
+    from vikingbot.compile.results import FileDraft, FileResponse, Group
+    from vikingbot.compile.sources import split_source
+
+    changes = None if case in ("absent", "plain") else {}
+    if case in ("rescan", "delete", "mixed"):
+        changes = {
+            "scopes": [
+                {
+                    "uri": "viking://resources/docs/a.md",
+                    "change_type": "rescan" if case == "rescan" else "deleted",
+                    "recursive": case == "rescan",
+                    "change_types": ["deleted"],
+                }
+            ]
+        }
+    elif case == "null":
+        changes = {"scopes": None}
+    stored = {"inputs": {}}
+    runtime = Pipeline.__new__(Pipeline)
+    runtime.files = SimpleNamespace(
+        get=AsyncMock(side_effect=stored.get), put=AsyncMock(side_effect=stored.__setitem__)
+    )
+    runtime.changes, runtime.limits = changes, CompileLimits()
+    runtime.records, runtime.evidence, runtime.status, runtime.metrics = {}, {}, {}, Counter()
+    runtime.target = "viking://resources/wiki"
+
+    async def batches():
+        if case in ("plain", "mixed"):
+            stored["inputs"]["viking://resources/docs/b.md"] = "pending"
+            yield split_source("viking://resources/docs/b.md", "Unrelated fact", 100)
+
+    records = await runtime.seed(batches())
+    deleted = [r for r in records if runtime.evidence[r.record_id].get("change_type") == "deleted"]
+    assert len(deleted) == int(case in ("delete", "mixed"))
+    if deleted:
+        record = deleted[0]
+        assert (await payload(runtime, record))["payload"]["change_type"] == "deleted"
+        assert record.source_refs == [record.record_id]
+        result = FileResponse(
+            files=[FileDraft(path="a.md", content="Remaining facts", inputs=[record.record_id])]
+        )
+        file_ops.validate_files(runtime, result, Group("test", records), records, {})
+        result.files[0].inputs = ["viking://resources/docs/a.md"]
+        with pytest.raises(file_ops.InputReferenceError):
+            file_ops.validate_files(runtime, result, Group("test", records), records, {})
+    assert len(records) == len(deleted) + int(case in ("plain", "mixed"))
+    await runtime.write_coverage()
+    assert set(stored["coverage"]["inputs"]) == set(stored["inputs"])
