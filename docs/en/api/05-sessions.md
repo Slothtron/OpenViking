@@ -927,7 +927,7 @@ If the archive does not exist, is incomplete, or does not belong to the session,
 
 #### 1. API Implementation Introduction
 
-Delete the session directory, including messages, archives, and session audit records. Long-term memories already extracted into user or Peer memory directories remain; locate and delete those URIs separately when needed. This endpoint has no automatic undo. The privacy config (`category=session`, `target_key=session_id`) is retained.
+Delete the session directory, including messages, archives, and session audit records. Long-term memories already extracted into user or Peer memory directories remain; locate and delete those URIs separately when needed. This endpoint has no automatic undo. The corresponding Privacy config (`category=session`, `target_key=session_id`) is retained.
 
 **Code Entries:**
 - `openviking/server/routers/sessions.py:delete_session()` - HTTP route

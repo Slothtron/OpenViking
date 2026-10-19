@@ -1,25 +1,28 @@
-# 隐私配置与 Skill 隐私提取/加载
+# 隐私配置与自动管理
 
-本文介绍 OpenViking 的隐私配置能力，以及它与 Skill 写入（提取）和读取（加载还原）的协作机制。
+本文介绍 OpenViking 的隐私配置能力，以及它与技能/会话写入（提取）和读取（加载还原）的协作机制。
 
 ## 目标
 
-隐私配置用于把敏感值（如 `api_key`、`token`、`base_url`）从技能正文中分离出来，减少已识别敏感值在 `SKILL.md` 中的明文存储，并支持版本查询和切换。抽取依赖模型，只替换识别并匹配成功的片段，不能保证发现所有敏感信息。
+隐私配置用于把敏感值（如 `api_key`、`token`）从内容（如技能、会话）中分离出来。被自动扫描的敏感信息，保存在 OpenViking 用户空间的隐私配置中并保留版本记录，内容则保存占位符，读取时可根据当前生效配置还原。
 
 核心目标：
 
-- 写入时自动抽取敏感值并占位符化
-- 读取时按当前生效配置自动还原
+- 写入时自动提取敏感值并占位符化
+- 读取时按内容类型还原
 - 支持版本查询、切换与审计
 
 ---
 
 ## 核心对象与存储结构
 
-隐私配置按二级键组织：`category + target_key`。
+隐私配置在当前用户空间内按二级键组织：`category + target_key`。
 
-- `category`：配置类别（当前 Skill 使用 `skill`）
-- `target_key`：目标标识（通常是 skill 名）
+| 内容 | `category` | `target_key` |
+|---|---|---|
+| Skill | `skill` | Skill 名称 |
+| Session | `session` | Session ID |
+| 个人密钥 | `credential` | 如 `github`、`database` |
 
 用户空间下的存储路径：
 
@@ -33,7 +36,7 @@ viking://user/{user_id}/privacy/{category}/{target_key}/
     └── ...
 ```
 
-`current.json` 与 `history/version_x.json` 都是完整快照（`values` 整包）。
+`current.json` 与 `history/version_x.json` 都是完整的隐私值字典（`values` 整包）。而 Session 或 Skill 中的正文只会保存这些隐私值的引用（即占位符）。
 
 ---
 
@@ -55,20 +58,23 @@ viking://user/{user_id}/privacy/{category}/{target_key}/
 
 ---
 
-## Skill 隐私提取（写入链路）
+## 技能的隐私提取与读取还原
+
+### 自动提取（写入链路）
 
 当通过 `add_skill` 写入 Skill 时，会走隐私提取与占位符化流程。
 
 ```
 add_skill
   -> SkillProcessor._sanitize_skill_privacy
+    -> PrivacySanitizer（保护已登记的个人密钥）
     -> extract_skill_privacy_values (LLM 抽取 values)
     -> placeholderize_skill_content_with_blocks (明文替换为占位符)
     -> privacy.upsert(category="skill", target_key=skill_name, values=...)
   -> 写入占位符化后的 SKILL.md
 ```
 
-### 关键点
+#### 关键点
 
 1. **抽取结果来源**：模型返回 JSON，读取 `values` 字段作为隐私键值。  
 2. **内容替换**：原文中命中的敏感片段会替换为占位符：
@@ -80,7 +86,7 @@ add_skill
 
 ---
 
-## Skill 加载还原（读取链路）
+### 加载还原（读取链路）
 
 读取 `SKILL.md` 时，`FSService.read` 会尝试自动还原占位符。
 
@@ -91,14 +97,14 @@ fs.read(uri)
   -> restore_skill_content(content, skill_name, current.values)
 ```
 
-### URI 匹配
+#### URI 匹配
 
 当前支持通过后缀识别 Skill：`/skills/{name}/SKILL.md`，可兼容 user-scoped skill 路径，例如：
 
 - `viking://~/skills/{name}/SKILL.md`
 - `viking://user/{user_id}/skills/{name}/SKILL.md`
 
-### restore 规则
+#### restore 规则
 
 `restore_skill_content` 的行为如下：
 
@@ -121,6 +127,62 @@ fs.read(uri)
 ---
 
 `read` 返回的是还原后的值；“额外配置”提示也会包含配置值。Privacy API 和历史快照同样可以返回完整值，该功能不等于响应脱敏或存储加密。需要加密存储时，另见[存储加密](./10-encryption.md)。
+
+## 会话的隐私提取与读取还原
+
+### 自动提取（写入链路）
+
+向 Session 写入消息时，会在工具输出外置和消息落盘前，通过常见的规则，提取敏感值并替换为占位符。
+
+```
+Session.add_messages_async
+  -> extract_and_store_session_privacy
+    -> PrivacySanitizer（保护已登记的个人密钥）
+    -> PrivacyExtractor（规则提取新值并占位符化）
+    -> privacy.patch_values(category="session", target_key=session_id, updates=...)
+  -> 工具输出外置
+  -> 写入占位符化后的消息
+```
+
+#### 关键点
+
+1. **提取结果来源**：通过固定的常见规则识别凭据，不调用模型，支持 `password=...`、`api_key=...`、`Authorization: Bearer ...` 等形式。
+2. **覆盖范围**：处理 TextPart 文本、ContextPart 摘要和 ToolPart 输入、输出。工具输入中，敏感字段对应的值整体保存和遮罩。
+3. **内容替换**：已登记值复用对应引用，新提取的值保存到当前 Session 的隐私配置中，正文使用包含所有者的规范引用，例如：
+   - `{{ov_privacy:alice:viking://~/privacy/session/demo#/values/value_<随机ID>}}`
+4. **写盘结果**：先保存隐私值，再写入占位符化的消息；未匹配内容保持原样。提取或保存失败时，拒绝本批消息。
+
+---
+
+### 加载还原（读取链路）
+
+读取 Session 消息或外置工具输出时，`FSService.read` 会尝试自动还原占位符。
+
+```
+fs.read(uri)
+  -> get_session_id_from_uri(uri, session_root)
+  -> restore_session_read
+    -> privacy.get_current(category, target_key)
+    -> 还原正文中的引用
+```
+
+#### URI 匹配
+
+当前支持还原当前用户 Session 目录下的以下文件：
+
+- `sessions/{session_id}/messages.jsonl`
+- `sessions/{session_id}/history/archive_*/messages.jsonl`
+- `sessions/{session_id}/tool-results/{id}/output.txt`
+
+#### restore 规则
+
+1. **当前用户的引用，且对应值存在**：使用引用目标的当前值替换；工具输入中的整值引用按原始 JSON 类型还原。
+
+2. **其他用户的引用，或对应值不存在**：保留引用不替换。
+
+> 还原只影响读取结果，不修改存储文件。引用跟随当前生效配置，轮换字段值或激活其他版本后，历史消息下次读取时也使用新的当前值。
+
+---
 
 ## 与 CLI/API 的关系
 
@@ -168,6 +230,7 @@ ov privacy scan --uri viking://~/resources/project-a
 ## 相关文档
 
 - [技能](../api/04-skills.md) - Skill 写入与读取 API
+- [会话](../api/05-sessions.md) - Session 创建、消息写入
 - [隐私配置 API](../api/10-privacy.md) - 隐私配置端点说明
 - [上下文提取](./06-extraction.md) - 内容提取主流程
 - [架构概述](./01-architecture.md) - 系统分层与模块关系

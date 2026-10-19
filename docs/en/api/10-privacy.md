@@ -1,6 +1,6 @@
 # Privacy Configs
 
-Privacy configs manage sensitive values (for example, a skill's `api_key` and `base_url`) by `category + target_key` in the current user's space. Changed values create a version snapshot. You can query history and switch the active version. Submitting the same values as the current version does not create a new version.
+Privacy configs manage sensitive values in Skills and Sessions (such as `api_key` and `token`) by `category + target_key` in the current user's space. Changed values create a version snapshot. You can query history and switch the active version. Submitting the same values as the current version does not create a new version.
 
 These examples use the current user’s API key. In trusted mode, supply the identity headers required by your deployment. Reads and CLI output contain the stored values; `***` below is an example placeholder, not automatic redaction.
 
@@ -101,7 +101,7 @@ The server applies the same validation to HTTP, CLI, Embedded, and internal writ
 | Item | Limit |
 |------|------|
 | `category` / `target_key` | Non-empty, at most 255 ASCII characters; only letters, digits, `_`, `-`, `.`, and `@`; `.` and `..` are forbidden and at most one `@` is allowed |
-| Top-level values fields | At most 128 |
+| Top-level values fields | At most 1024 for `category=session`; at most 128 for other categories |
 | Field name | Non-empty, at most 255 UTF-8 bytes, no control characters |
 | Individual string | At most 64 KiB UTF-8 |
 | Serialized values | At most 1 MiB |

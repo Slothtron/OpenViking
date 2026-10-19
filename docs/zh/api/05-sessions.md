@@ -927,7 +927,7 @@ ov session get-session-archive a1b2c3d4 archive_002
 
 #### 1. API 实现介绍
 
-删除该会话目录，包括消息、归档历史和会话内的审计记录。已经抽取到用户或 Peer 记忆目录的长期记忆不会随之删除；需要删除这些记忆时，单独定位并删除对应 URI。此接口不提供自动撤销。已经保存的 Privacy 配置（`category=session`、`target_key=session_id`）也不会随之删除。
+删除该会话目录，包括消息、归档历史和会话内的审计记录。已经抽取到用户或 Peer 记忆目录的长期记忆不会随之删除；需要删除这些记忆时，单独定位并删除对应 URI。此接口不提供自动撤销。对应的 Privacy 配置（`category=session`、`target_key=session_id`）会保留。
 
 **代码入口**：
 - `openviking/server/routers/sessions.py:delete_session()` - HTTP 路由
