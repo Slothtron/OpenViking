@@ -399,15 +399,12 @@ async def test_async_reindex_reuses_accepted_task_on_replay(monkeypatch, failure
     from openviking.service.reindex_executor import REINDEX_ENQUEUE_ERROR, ReindexExecutor
     from openviking.service.task_store import PersistentTaskStore
     from openviking.service.task_tracker import TaskTracker
-    from openviking.service.task_work_index import QueueTaskMetadata, TaskWorkIndex
     from openviking_cli.exceptions import OpenVikingError
     from openviking_cli.session.user_id import UserIdentifier
     from tests.test_task_tracker import _FakeAgfs
 
     owner = {"account_id": "account-1", "user_id": "user-1"}
     tracker = TaskTracker(PersistentTaskStore(_FakeAgfs()))
-    index = TaskWorkIndex()
-    tracker.attach_work_index(index)
     monkeypatch.setattr("openviking.service.reindex_executor.get_task_tracker", lambda: tracker)
     agfs = SimpleNamespace(
         pathlock_acquire_tree=AsyncMock(return_value={"lease": "root"}),
@@ -429,7 +426,7 @@ async def test_async_reindex_reuses_accepted_task_on_replay(monkeypatch, failure
     async def enqueue(_queue, payload):
         if failure == "enqueue":
             raise OSError("enqueue")
-        index.register("Reindex", QueueTaskMetadata(payload["task_id"], "work-1", **owner))
+        await tracker.register_work(payload["task_id"], "work-1", "Reindex", **owner)
         if failure == "enqueue_committed":
             raise OSError("enqueue response lost")
         return "queued"

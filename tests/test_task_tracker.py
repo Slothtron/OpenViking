@@ -437,6 +437,20 @@ async def test_create_if_no_running_isolated_by_owner(tracker: TaskTracker):
     assert alice_task.task_id != bob_task.task_id
 
 
+async def test_create_if_no_running_replays_only_the_same_operation(tracker: TaskTracker):
+    params = {"task_id": "reindex-replay", **_owner_kwargs()}
+    first = await tracker.create_if_no_running("reindex", "viking://resources/demo", **params)
+    replay = await tracker.create_if_no_running("reindex", "viking://resources/demo", **params)
+    assert first is not None and replay is not None
+    assert replay.task_id == first.task_id
+    for task_type, uri in [
+        ("compile", "viking://resources/demo"),
+        ("reindex", "viking://resources/other"),
+    ]:
+        with pytest.raises(ValueError, match="Task ID belongs to another operation"):
+            await tracker.create_if_no_running(task_type, uri, **params)
+
+
 # ── Serialization ──
 
 

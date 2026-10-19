@@ -6,9 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from vikingbot.compile import review
+from vikingbot.compile import entry, review
 from vikingbot.compile.models import CompileLimits
-from vikingbot.compile.pipeline_io import JsonModel, ModelCallLimitError
+from vikingbot.compile.pipeline_io import JsonModel, ModelCallError, ModelCallLimitError
 from vikingbot.compile.plan import Contract, Node, ReviewDecision
 from vikingbot.compile.service import BotCompileService
 from vikingbot.config.schema import Config
@@ -76,6 +76,25 @@ async def test_review_failures_preserve_plan_and_cancellation(failure):
 def response(name, arguments):
     """Return one scripted reader or final-result tool call."""
     return LLMResponse(None, [ToolCallRequest("call", name, arguments, 0)])
+
+
+@pytest.mark.parametrize("fatal", [False, True])
+async def test_incremental_entry_preserves_provider_failure_semantics(fatal):
+    """Scoped readers retain pipeline fallback for limits and propagate provider failures."""
+    error = ModelCallError("provider failure") if fatal else ModelCallLimitError("deadline")
+    runtime = SimpleNamespace(
+        output_instructions="",
+        tool_context=None,
+        model=SimpleNamespace(ask=AsyncMock(side_effect=error)),
+        direct_output_format="files",
+    )
+    if fatal:
+        with pytest.raises(ModelCallError, match="provider failure"):
+            await entry.run(runtime, [], {})
+    else:
+        assert await entry.run(runtime, [], {}) is None
+    assert runtime.model.ask.await_args.kwargs["readers"] == {}
+    assert runtime.direct_output_format is None
 
 
 @pytest.mark.parametrize("case", ["repeat", "progress", "error"])

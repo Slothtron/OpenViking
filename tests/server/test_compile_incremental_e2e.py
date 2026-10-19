@@ -197,7 +197,9 @@ async def test_queued_cancel_finishes_history_without_releasing_running_task(
         )
         queued = await compile_service.create(request, connection={}, ctx=ctx)
         if cancel_at == "pending":
-            await tracker.cancel(queued.task_id, ctx.account_id, ctx.user.user_id)
+            await tracker.cancel(
+                queued.task_id, account_id=ctx.account_id, user_id=ctx.user.user_id
+            )
         else:
             enqueue = manager.enqueue
 
@@ -219,13 +221,17 @@ async def test_queued_cancel_finishes_history_without_releasing_running_task(
     finally:
         release.set()
         await asyncio.wait_for(worker, 10)
-    assert (await tracker.get(first.task_id, ctx.account_id, ctx.user.user_id)).status == "completed"
+    assert (
+        await tracker.get(first.task_id, ctx.account_id, ctx.user.user_id)
+    ).status == "completed"
     assert (await store.get(ctx.account_id, target_id))["active_task_id"] is None
     submit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_cancel_waits_for_output_lock_before_releasing_target(service, compile_task, monkeypatch):
+async def test_cancel_waits_for_output_lock_before_releasing_target(
+    service, compile_task, monkeypatch
+):
     """Cancellation retains target ownership until rollback can preserve ordinary edits."""
     from openviking.storage.errors import ResourceBusyError
 
@@ -263,12 +269,14 @@ async def test_cancel_waits_for_output_lock_before_releasing_target(service, com
     agfs = service.viking_fs._async_agfs
     lease = await agfs.pathlock_acquire_exact(service.viking_fs._uri_to_path(uri, ctx=ctx))
     try:
-        await tracker.cancel(task.task_id, ctx.account_id, ctx.user.user_id)
+        await tracker.cancel(task.task_id, account_id=ctx.account_id, user_id=ctx.user.user_id)
         await asyncio.wait_for(busy.wait(), 5)
         await asyncio.sleep(0.05)
         current = await tracker.get(task.task_id, ctx.account_id, ctx.user.user_id)
         assert current.status == "cancelling"
-        record = await lifecycle.store.get(ctx.account_id, task.meta["request"]["compile"]["target_id"])
+        record = await lifecycle.store.get(
+            ctx.account_id, task.meta["request"]["compile"]["target_id"]
+        )
         run = await lifecycle.store.get_run(ctx.account_id, record["id"], task.task_id)
         assert run["finished_at"] is None and record["active_task_id"] == task.task_id
     finally:
@@ -342,6 +350,7 @@ async def test_finish_accepts_async_reindex_before_completing_task(
     service, monkeypatch, compile_task
 ):
     from openviking.service.core import OpenVikingService
+    from openviking.service.task_work_index import extract_task_metadata
 
     monkeypatch.setattr(service, "reindex", OpenVikingService.reindex.__get__(service))
     ctx, task = compile_task
@@ -377,6 +386,9 @@ async def test_finish_accepts_async_reindex_before_completing_task(
         ExternalTaskSnapshot(status="completed"), task_id=task.task_id, **identity
     )
     await queue.ack(delivery["id"], delivery)
+    metadata = extract_task_metadata(delivery)
+    assert metadata is not None
+    await tracker.mark_work_done(task.task_id, metadata.work_id, **identity)
     assert (await tracker.get(task.task_id, **identity)).status == "completed"
     run = (await service.compile.list_runs(TO, ctx, limit=1, cursor=None))["runs"][0]
     reindex = await tracker.get(run["reindex_task_id"], **identity)

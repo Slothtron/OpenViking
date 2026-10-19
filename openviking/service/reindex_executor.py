@@ -244,7 +244,11 @@ class ReindexExecutor:
         if task_id is not None and task.error == REINDEX_ENQUEUE_ERROR:
             raise OpenVikingError(REINDEX_ENQUEUE_ERROR, code="UNAVAILABLE")
         if task_id is not None and (
-            task.stage == "queued" or task.status != "pending" or tracker.has_work(task.task_id)
+            task.stage == "queued"
+            or task.status != "pending"
+            or await tracker.has_work(
+                task.task_id, account_id=ctx.account_id, user_id=ctx.user.user_id
+            )
         ):
             return {
                 "task_id": task.task_id,
@@ -301,7 +305,9 @@ class ReindexExecutor:
         except BaseException:
             if lease is not None and service is not None:
                 await service.viking_fs._async_agfs.pathlock_release(lease)
-            if not enqueued and not tracker.has_work(task.task_id):
+            if not enqueued and not await tracker.has_work(
+                task.task_id, account_id=ctx.account_id, user_id=ctx.user.user_id
+            ):
                 await tracker.fail(
                     task.task_id,
                     REINDEX_ENQUEUE_ERROR,
