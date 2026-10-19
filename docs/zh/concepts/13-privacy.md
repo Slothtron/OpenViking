@@ -150,7 +150,7 @@ Session.add_messages_async
 2. **覆盖范围**：处理 TextPart 文本、ContextPart 摘要和 ToolPart 输入、输出。工具输入中，敏感字段对应的值整体保存和遮罩。
 3. **内容替换**：原文中新提取的敏感片段会替换为占位符：
    - <code>&#123;&#123;ov_privacy:session:&#123;session_id&#125;:&#123;field_name&#125;&#125;&#125;</code>
-   - 若敏感片段与已登记的个人密钥（credential）匹配，则优先使用唯一匹配字段的占位符，例如 `{{ov_privacy:alice:viking://~/privacy/credential/github#/values/pat}}`。
+   - 若敏感片段与已登记的个人密钥（credential）匹配，则优先使用唯一匹配字段的占位符，例如 <code>&#123;&#123;ov_privacy:alice:viking://~/privacy/credential/github#/values/pat&#125;&#125;</code>。
 4. **写盘结果**：匹配成功的片段以占位符保存，未匹配内容保持原样。新提取的隐私值保存在当前 Session 的配置中。
 
 ---
@@ -187,7 +187,7 @@ fs.read(uri)
 
    -> 保留占位符不替换。
 
-3. **content 中的占位符指向其他用户，或使用不属于当前会话的 `{{ov_privacy:session:...}}`**
+3. **content 中的占位符指向其他用户，或使用不属于当前会话的 <code>&#123;&#123;ov_privacy:session:...&#125;&#125;</code>**
 
    -> 保留占位符不替换。
 
