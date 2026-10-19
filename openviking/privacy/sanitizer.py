@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from openviking.privacy.reference import build_privacy_field_reference
 from openviking.pyagfs import get_privacy_matcher_class
 from openviking.server.identity import RequestContext
-from openviking_cli.exceptions import ResourceExhaustedError
+from openviking_cli.exceptions import InvalidArgumentError, ResourceExhaustedError
 
 if TYPE_CHECKING:
     from openviking.privacy.service import UserPrivacyConfigService
@@ -75,6 +75,42 @@ class PrivacySanitizer:
     def max_content_bytes(self) -> int:
         """Maximum UTF-8 input size accepted by this sanitizer."""
         return self._max_content_bytes
+
+    @property
+    def max_replacements(self) -> int:
+        return self._max_replacements
+
+    async def prepare_matcher(
+        self, ctx: RequestContext
+    ) -> Callable[[str], tuple[PrivacyReplacement, ...]]:
+        """Prepare a cached, bounded match query for a batch of original texts.
+
+        The callable may run in a worker thread. It returns positions and existing
+        references so rule extraction can combine hits before rewriting content.
+        """
+        matcher = await self._matcher(ctx)
+
+        def find(content: str) -> tuple[PrivacyReplacement, ...]:
+            try:
+                replacements, ambiguous, exceeded = matcher.find_limited(
+                    content, self._max_replacements, self._max_content_bytes
+                )
+            except OverflowError:
+                raise ResourceExhaustedError(
+                    "Content exceeds the Privacy sanitizer size limit"
+                ) from None
+            if ambiguous:
+                raise InvalidArgumentError(
+                    "Content contains a Privacy value mapped to multiple fields; "
+                    "insert the intended owner-bound reference explicitly"
+                )
+            if exceeded:
+                raise ResourceExhaustedError(
+                    "Content exceeds the Privacy sanitizer replacement limit"
+                )
+            return tuple(PrivacyReplacement(*item) for item in replacements)
+
+        return find
 
     async def sanitize(
         self,

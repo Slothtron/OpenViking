@@ -920,6 +920,7 @@ fn cache_policy_from_config(config: &RagfsCacheConfig) -> CachePolicy {
 
 mod git;
 mod privacy;
+mod privacy_extractor;
 
 fn py_detach_blocking<T, F>(py: Python<'_>, f: F) -> T
 where
@@ -3067,6 +3068,7 @@ impl RAGFSBindingClient {
 fn ragfs_python(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RAGFSBindingClient>()?;
     m.add_class::<privacy::PyPrivacyMatcher>()?;
+    m.add_class::<privacy_extractor::PyPrivacyExtractor>()?;
     m.add_function(wrap_pyfunction!(reopen_tracing_file, m)?)?;
 
     // Import the Python business exception so native code raises the same type
