@@ -383,18 +383,39 @@ def replays_reasoning(upstream: dict) -> bool:
     return upstream.get("vendor") in REASONING_VENDORS if value is None else value
 
 
-def usage_of(value: dict) -> dict:
-    """Token counts from any protocol's usage, including compatible endpoints that mix forms."""
+# Fields relays put cache counts in, at the top of usage or in its token details.
+CACHE_READ = ("cache_read_input_tokens", "cached_tokens", "prompt_cache_hit_tokens")
+CACHE_WRITE = ("cache_creation_input_tokens", "cache_write_tokens", "cached_creation_tokens")
+
+
+def usage_of(value: dict, excludes_cache: bool = False) -> dict:
+    """Token counts from any protocol's usage, including compatible endpoints that mix forms.
+
+    ``input_tokens`` always includes cached and written tokens: Anthropic counts them apart
+    (``excludes_cache``), Chat and Responses totals already hold them.
+    """
     usage = value.get("usage") or {}
-    details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
-    cached = usage.get("cache_read_input_tokens", details.get("cached_tokens", 0)) or 0
-    written = usage.get("cache_creation_input_tokens", 0) or 0
-    input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
-    if "cache_read_input_tokens" in usage:
+    scopes = [
+        usage,
+        usage.get("prompt_tokens_details") or {},
+        usage.get("input_tokens_details") or {},
+    ]
+    # Relays copy one count into several fields and zero-fill the rest.
+    cached, written = (
+        max((s[k] for s in scopes for k in keys if s.get(k) is not None), default=0)
+        for keys in (CACHE_READ, CACHE_WRITE)
+    )
+    # Each protocol's own total first; compatible endpoints often fill both, one with zero.
+    own, other = (
+        ("input_tokens", "prompt_tokens") if excludes_cache else ("prompt_tokens", "input_tokens")
+    )
+    input_tokens = usage.get(own) or usage.get(other) or 0
+    # A total below its own cache counted the cache apart, as older relays do too.
+    if excludes_cache or input_tokens < cached + written:
         input_tokens += cached + written
     return {
         "input_tokens": input_tokens,
-        "output_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0,
+        "output_tokens": usage.get("completion_tokens") or usage.get("output_tokens") or 0,
         "cached_tokens": cached,
         "cache_write_tokens": written,
     }
