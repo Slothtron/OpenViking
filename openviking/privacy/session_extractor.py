@@ -5,8 +5,8 @@
 import asyncio
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, replace
+from secrets import token_urlsafe
 from typing import Any, TypeVar
-from uuid import uuid4
 
 from openviking.message.part import ContextPart, ImagePart, Part, TextPart, ToolPart
 from openviking.privacy.reference import build_privacy_field_reference
@@ -19,11 +19,16 @@ from openviking.privacy.rules import (
 from openviking.privacy.sanitizer import PrivacyReplacement, PrivacySanitizer
 from openviking.privacy.service import UserPrivacyConfigService
 from openviking.server.identity import RequestContext
-from openviking_cli.exceptions import InvalidArgumentError
+from openviking_cli.exceptions import (
+    AlreadyExistsError,
+    InvalidArgumentError,
+    ResourceExhaustedError,
+)
 
 MAX_BATCH_CHARS = 16 * 1024 * 1024
 MAX_DEPTH = 32
 MAX_NODES = 100_000
+MAX_FIELD_ID_ATTEMPTS = 8
 _Matcher = Callable[[str], tuple[PrivacyReplacement, ...]]
 _Text = TypeVar("_Text", str, None)
 
@@ -37,23 +42,30 @@ async def extract_and_store_session_privacy(
 ) -> list[dict]:
     """Extract on copies, persist discoveries, then protect remaining registered values."""
     matcher = await sanitizer.prepare_matcher(ctx) if sanitizer else _no_matches
-    sanitized, added = await asyncio.to_thread(
-        extract_session_privacy_values,
-        session_id,
-        messages_spec,
-        owner_user_id=ctx.user.user_id,
-        match_registered=matcher,
-    )
-    if not added:
-        return sanitized
-    await privacy.patch_values(
-        ctx,
-        "session",
-        session_id,
-        added,
-        updated_by=ctx.user.user_id,
-        change_reason="Session message extraction",
-    )
+    for _ in range(MAX_FIELD_ID_ATTEMPTS):
+        sanitized, added = await asyncio.to_thread(
+            extract_session_privacy_values,
+            session_id,
+            messages_spec,
+            owner_user_id=ctx.user.user_id,
+            match_registered=matcher,
+        )
+        if not added:
+            return sanitized
+        try:
+            await privacy.insert_values(
+                ctx,
+                "session",
+                session_id,
+                added,
+                updated_by=ctx.user.user_id,
+                change_reason="Session message extraction",
+            )
+        except AlreadyExistsError:
+            continue
+        break
+    else:
+        raise ResourceExhaustedError("Could not allocate unique Session privacy field IDs")
     # Refresh the matcher to include newly saved values.
     matcher = await sanitizer.prepare_matcher(ctx) if sanitizer else _no_matches
     rewriter = _SessionReferenceRewriter(matcher)
@@ -204,9 +216,13 @@ class _SessionExtraction(_PayloadTransformer):
             matches = self.value_matcher(value)
             if len(matches) == 1 and matches[0].start == 0 and matches[0].end == len(value):
                 return matches[0].reference
-        key = f"value_{uuid4().hex}"
-        self.values[key] = value
-        return build_session_placeholder(self.session_id, key, self.owner_user_id)
+        for _ in range(MAX_FIELD_ID_ATTEMPTS):
+            # Six random bytes encode to eight URL-safe characters.
+            key = token_urlsafe(6)
+            if key not in self.values:
+                self.values[key] = value
+                return build_session_placeholder(self.session_id, key, self.owner_user_id)
+        raise ResourceExhaustedError("Could not allocate unique Session privacy field IDs")
 
     def transform_text(self, text: _Text) -> _Text:
         super().transform_text(text)

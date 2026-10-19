@@ -12,7 +12,7 @@ from openviking.privacy.skill_placeholder import placeholderize_skill_content_wi
 from openviking.privacy.validation import PRIVACY_MAX_FIELDS, SESSION_PRIVACY_MAX_FIELDS
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.viking_fs import VikingFS
-from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
+from openviking_cli.exceptions import AlreadyExistsError, InvalidArgumentError, NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -497,3 +497,20 @@ async def test_patch_preserves_equal_fields_and_rotates_only_named_field(monkeyp
     assert rotated.values == {"a": "rotated-secret", "b": "new-secret", "c": "new-secret"}
     previous = await privacy.get_version(ctx, category, "demo", current.version)
     assert previous.values == current.values
+
+
+@pytest.mark.asyncio
+async def test_insert_values_rejects_the_entire_batch_even_when_existing_value_is_equal():
+    privacy = UserPrivacyConfigService(_MemoryPrivacyStorage())
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+    await privacy.upsert(ctx, "session", "demo", {"taken001": "old-secret"})
+    with pytest.raises(AlreadyExistsError):
+        await privacy.insert_values(
+            ctx,
+            "session",
+            "demo",
+            updates={"taken001": "old-secret", "free0002": "new-secret"},
+        )
+    current = await privacy.get_current(ctx, "session", "demo")
+    assert current.values == {"taken001": "old-secret"}
+    assert await privacy.list_versions(ctx, "session", "demo") == [1]

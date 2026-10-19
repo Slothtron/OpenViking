@@ -30,7 +30,7 @@ from openviking.privacy.validation import (
 from openviking.server.identity import RequestContext
 from openviking.storage.viking_fs import VikingFS
 from openviking.utils.time_utils import get_current_timestamp
-from openviking_cli.exceptions import NotFoundError
+from openviking_cli.exceptions import AlreadyExistsError, NotFoundError
 
 
 class UserPrivacyConfigService:
@@ -287,6 +287,35 @@ class UserPrivacyConfigService:
         async with self._config_lock(ctx, category, target_key) as lease:
             current = await self.get_current(ctx, category, target_key)
             values = dict(current.values) if current is not None else {}
+            values.update(updates)
+            return await self._upsert_locked(
+                ctx=ctx,
+                category=category,
+                target_key=target_key,
+                values=values,
+                updated_by=updated_by,
+                change_reason=change_reason,
+                labels=labels,
+                lease_ref=lease,
+                current=current,
+            )
+
+    async def insert_values(
+        self,
+        ctx: RequestContext,
+        category: str,
+        target_key: str,
+        updates: dict[str, Any],
+        updated_by: str = "",
+        change_reason: str = "",
+        labels: Optional[dict[str, Any]] = None,
+    ) -> UserPrivacyConfigVersion:
+        """Atomically add new fields; reject the batch if any field already exists."""
+        async with self._config_lock(ctx, category, target_key) as lease:
+            current = await self.get_current(ctx, category, target_key)
+            values = dict(current.values) if current is not None else {}
+            if not values.keys().isdisjoint(updates):
+                raise AlreadyExistsError(f"{category}/{target_key}", "privacy field")
             values.update(updates)
             return await self._upsert_locked(
                 ctx=ctx,

@@ -139,7 +139,7 @@ Session.add_messages_async
   -> extract_and_store_session_privacy
     -> PrivacySanitizer (protect registered personal credentials)
     -> PrivacyExtractor (extract new values using rules and replace them with placeholders)
-    -> privacy.patch_values(category="session", target_key=session_id, updates=...)
+    -> privacy.insert_values(category="session", target_key=session_id, updates=...)
   -> externalize tool output
   -> write placeholderized messages
 ```
@@ -149,7 +149,7 @@ Session.add_messages_async
 1. **Extraction source**: fixed rules for common credential patterns, without model calls. Supported forms include `password=...`, `api_key=...`, and `Authorization: Bearer ...`.
 2. **Coverage**: TextPart text, ContextPart abstracts, and ToolPart input and output. Values under sensitive tool input keys are stored and masked as a whole.
 3. **Content replacement**: registered values reuse their references. Newly extracted values are saved in the current Session's privacy config, and the content uses canonical references that include the owner, for example:
-   - `{{ov_privacy:alice:viking://~/privacy/session/demo#/values/value_<randomID>}}`
+   - `{{ov_privacy:alice:viking://~/privacy/session/<sessionID>#/values/<randomID>}}`
 4. **Persisted content**: privacy values are saved before writing placeholderized messages; unmatched content remains unchanged. Extraction or persistence failures reject the message batch.
 
 ---

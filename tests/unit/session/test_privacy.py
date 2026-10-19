@@ -3,6 +3,7 @@
 """Session privacy round-trips complete messages and rejects unsafe input."""
 
 import json
+import re
 from copy import deepcopy
 from dataclasses import asdict
 from types import SimpleNamespace
@@ -15,7 +16,7 @@ from openviking.privacy import session_extractor as extraction
 from openviking.privacy.reference import build_privacy_field_reference
 from openviking.privacy.session_extractor import extract_session_privacy_values
 from openviking.privacy.session_restore import get_session_id_from_uri, restore_session_read
-from openviking_cli.exceptions import InvalidArgumentError
+from openviking_cli.exceptions import InvalidArgumentError, ResourceExhaustedError
 
 
 def message_jsonl(specs):
@@ -69,6 +70,7 @@ async def test_extract_and_restore_complete_messages(privacy, request_context):
     ]
     before = deepcopy(specs)
     sanitized, values = extract_session_privacy_values("demo", specs)
+    assert all(re.fullmatch(r"[A-Za-z0-9_-]{8}", key) for key in values)
     # Sensitive containers are captured whole, with no references inside them.
     assert list(values.values()) == [
         "中文密码",
@@ -91,6 +93,29 @@ async def test_extract_and_restore_complete_messages(privacy, request_context):
     )
     specs[1]["parts"][0].tool_input["credentials"]["nested"].append("changed")
     assert "changed" not in json.dumps(list(values.values()))
+
+
+async def test_batch_field_id_collision_preserves_both_values(
+    monkeypatch, privacy, request_context
+):
+    ids = iter(["same0001", "same0001", "next0002"])
+    monkeypatch.setattr(extraction, "token_urlsafe", lambda _: next(ids))
+    specs = [{"parts": [ToolPart(tool_input={"password": "first", "api_key": "second"})]}]
+    protected, values = extract_session_privacy_values("demo", specs)
+    assert sorted(values.values()) == ["first", "second"]
+    privacy.get_current.return_value = SimpleNamespace(values=values)
+    assert await restore_session_read(
+        privacy, message_jsonl(protected), request_context, jsonl=True
+    ) == message_jsonl(specs)
+
+
+def test_exhausted_field_ids_reject_without_mutating_input(monkeypatch):
+    monkeypatch.setattr(extraction, "token_urlsafe", lambda _: "same0001")
+    specs = [{"parts": [ToolPart(tool_input={"password": "first", "api_key": "second"})]}]
+    before = deepcopy(specs)
+    with pytest.raises(ResourceExhaustedError, match="unique Session privacy field IDs"):
+        extract_session_privacy_values("demo", specs)
+    assert specs == before
 
 
 async def test_sensitive_field_names_do_not_leak_into_references(privacy, request_context):

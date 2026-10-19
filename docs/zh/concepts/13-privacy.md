@@ -139,7 +139,7 @@ Session.add_messages_async
   -> extract_and_store_session_privacy
     -> PrivacySanitizer（保护已登记的个人密钥）
     -> PrivacyExtractor（规则提取新值并占位符化）
-    -> privacy.patch_values(category="session", target_key=session_id, updates=...)
+    -> privacy.insert_values(category="session", target_key=session_id, updates=...)
   -> 工具输出外置
   -> 写入占位符化后的消息
 ```
@@ -149,7 +149,7 @@ Session.add_messages_async
 1. **提取结果来源**：通过固定的常见规则识别凭据，不调用模型，支持 `password=...`、`api_key=...`、`Authorization: Bearer ...` 等形式。
 2. **覆盖范围**：处理 TextPart 文本、ContextPart 摘要和 ToolPart 输入、输出。工具输入中，敏感字段对应的值整体保存和遮罩。
 3. **内容替换**：已登记值复用对应引用，新提取的值保存到当前 Session 的隐私配置中，正文使用包含所有者的规范引用，例如：
-   - `{{ov_privacy:alice:viking://~/privacy/session/demo#/values/value_<随机ID>}}`
+   - `{{ov_privacy:alice:viking://~/privacy/session/<sessionID>#/values/<randomID>}}`
 4. **写盘结果**：先保存隐私值，再写入占位符化的消息；未匹配内容保持原样。提取或保存失败时，拒绝本批消息。
 
 ---

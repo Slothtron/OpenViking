@@ -7,7 +7,6 @@ import json
 from copy import deepcopy
 from dataclasses import asdict
 from unittest.mock import AsyncMock
-from uuid import UUID
 
 import pytest
 
@@ -20,7 +19,7 @@ from openviking.privacy.session_extractor import extract_and_store_session_priva
 from openviking.privacy.session_restore import restore_session_read
 from openviking.server.config import ToolOutputExternalizationConfig
 from openviking.server.identity import RequestContext, Role
-from openviking_cli.exceptions import InvalidArgumentError
+from openviking_cli.exceptions import InvalidArgumentError, ResourceExhaustedError
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -200,11 +199,11 @@ async def test_batch_discovery_rejects_key_collision_before_message_write(
 ):
     from openviking.privacy import session_extractor
 
-    fixed_id = UUID(int=1)
-    monkeypatch.setattr(session_extractor, "uuid4", lambda: fixed_id)
+    fixed_id = "same0001"
+    monkeypatch.setattr(session_extractor, "token_urlsafe", lambda _: fixed_id)
     session = await service.sessions.create(ctx, "collision")
     reference = build_privacy_field_reference(
-        ctx.user.user_id, "session", session.session_id, f"value_{fixed_id.hex}"
+        ctx.user.user_id, "session", session.session_id, fixed_id
     )
     part = ToolPart(
         tool_input={"alpha-987654": 1, reference: 2}, tool_output="password=alpha-987654"
@@ -252,8 +251,21 @@ async def test_auto_created_session_extracts_before_persistence(service, ctx):
     assert "default-secret" in await service.fs.read(uri, ctx=ctx)
 
 
-async def test_concurrent_writers_preserve_messages_and_independent_fields(service, ctx):
-    await service.sessions.create(ctx, "concurrent")
+async def test_concurrent_writers_preserve_messages_and_independent_fields(
+    service, ctx, monkeypatch
+):
+    from openviking.privacy import session_extractor
+
+    ids = iter(["same0001"] * 8 + [f"next{i:04d}" for i in range(8)])
+    monkeypatch.setattr(session_extractor, "token_urlsafe", lambda _: next(ids))
+    session = await service.sessions.create(ctx, "concurrent")
+    await service.privacy_configs.upsert(
+        ctx, "session", session.session_id, {"same0001": "old-secret"}
+    )
+    old_reference = build_privacy_field_reference(
+        ctx.user.user_id, "session", session.session_id, "same0001"
+    )
+    await session.add_message_async("user", [TextPart(old_reference)])
     await asyncio.gather(
         *(
             service.sessions.session(ctx, "concurrent").add_message_async(
@@ -264,31 +276,44 @@ async def test_concurrent_writers_preserve_messages_and_independent_fields(servi
     )
     loaded = await service.sessions.get("concurrent", ctx)
     current = await service.privacy_configs.get_current(ctx, "session", "concurrent")
-    assert len(loaded.messages) == 8
-    assert len(current.values) == 8
-    assert set(current.values.values()) == {f"secret-{i}" for i in range(8)}
+    assert set(current.values.values()) == {"old-secret", *(f"secret-{i}" for i in range(8))}
+    assert current.version == 9
     restored = await service.fs.read(loaded.uri + "/messages.jsonl", ctx=ctx)
     assert sorted(json.loads(line)["parts"][0]["text"] for line in restored.splitlines()) == [
-        f"password=secret-{i}" for i in range(8)
+        "old-secret",
+        *(f"password=secret-{i}" for i in range(8)),
     ]
 
 
-async def test_privacy_storage_failure_rejects_batch_before_externalization(
-    service, ctx, monkeypatch
+@pytest.mark.parametrize(
+    "error", [ResourceExhaustedError, OSError], ids=["id-exhaustion", "storage"]
+)
+async def test_privacy_write_failure_rejects_batch_before_externalization(
+    service, ctx, monkeypatch, error
 ):
-    session = await service.sessions.create(ctx, "failure")
-    monkeypatch.setattr(
-        service.privacy_configs,
-        "patch_values",
-        AsyncMock(side_effect=OSError("storage unavailable")),
+    from openviking.privacy import session_extractor
+
+    session = await service.sessions.create(ctx, "privacy-write-failure")
+    await service.privacy_configs.upsert(
+        ctx, "session", session.session_id, {"taken001": "old-secret"}
     )
+    if error is ResourceExhaustedError:
+        monkeypatch.setattr(session_extractor, "token_urlsafe", lambda _: "taken001")
+    else:
+        monkeypatch.setattr(
+            service.privacy_configs,
+            "insert_values",
+            AsyncMock(side_effect=OSError("storage unavailable")),
+        )
     externalize = AsyncMock()
     monkeypatch.setattr(session._tool_outputs, "externalize_group", externalize)
-    with pytest.raises(OSError, match="storage unavailable"):
-        await session.add_message_async("user", [TextPart("password=secret")])
+    with pytest.raises(error):
+        await session.add_message_async("user", [TextPart("password=new-secret")])
     externalize.assert_not_awaited()
     assert await service.viking_fs.read_file(session.uri + "/messages.jsonl", ctx=ctx) == ""
-    assert await service.privacy_configs.get_current(ctx, "session", session.session_id) is None
+    current = await service.privacy_configs.get_current(ctx, "session", session.session_id)
+    assert current.values == {"taken001": "old-secret"}
+    assert await service.privacy_configs.list_versions(ctx, "session", session.session_id) == [1]
 
 
 async def test_values_equal_to_json_keys_do_not_change_message_identity(service, ctx):
