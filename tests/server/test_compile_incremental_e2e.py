@@ -6,14 +6,14 @@ run, so it checks the kernel half (registry, snapshots, change plan, finish).
 
 import asyncio
 from datetime import datetime
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from openviking.server.identity import RequestContext, Role
 from openviking.service.compile_scheduler import TZ, current_slot, next_slot
 from openviking.service.compile_service import CompileRequest
-from openviking.service.compile_targets import parse_schedule
+from openviking.service.compile_targets import CompileStore, CompileVersions, parse_schedule
 from openviking.service.external_task_service import ExternalTaskSnapshot
 from openviking.service.task_tracker import get_task_tracker
 from openviking.storage.content_write import ContentWriteCoordinator
@@ -106,9 +106,9 @@ def test_schedule_slots():
 @pytest.mark.asyncio
 async def test_file_version_metadata(service):
     """Legacy reads and appended versions use nested metadata."""
-    versions = service.compile.lifecycle.versions
+    store = service.compile.lifecycle.store
+    versions = CompileVersions(Mock(spec_set=CompileStore, wraps=store), service.viking_fs)
     uri, target_id = f"{TO}/legacy.md", "target_legacy"
-    path = versions._path("default", target_id, uri)
     defaults = {"task_id": None, "restored_from": None, "after_compile_snapshot": False}
     meta = {"task_id": "cmp_running", "restored_from": None, "after_compile_snapshot": True}
     legacy = {
@@ -117,14 +117,15 @@ async def test_file_version_metadata(service):
         "source_roots": [SRC],
         "versions": [{"version_id": "v1", "source": "manual", **meta}],
     }
-    await versions._store.write_json(path, legacy)
+    await store.put_version_index("default", target_id, legacy)
     loaded = await versions.load("default", target_id, uri)
     assert set(loaded) == {"uri", "next", "versions"}
+    assert await versions._indexes("default", target_id) == [loaded]
     assert versions._ordinary_version(loaded, "cmp_running")["meta"] == meta
     await versions.append(
         "default", target_id, uri, "snapshot_2", {"source": "external", "actor": None}
     )
-    stored = await versions._store.read_json(path)
+    stored = await store.get_version_index("default", target_id, uri)
     assert set(stored) == {"uri", "next", "versions"}
     assert [version["meta"] for version in stored["versions"]] == [meta, defaults]
     for version in stored["versions"]:
@@ -169,6 +170,9 @@ async def test_first_compile_created_at(service, compile_task):
         ctx.account_id, first.meta["request"]["compile"]["target_id"], first.task_id
     )
     assert initial["operation_type"] == "initial" and initial["conflicts_num"] == 0
+    assert await store.get_outputs(
+        ctx.account_id, first.meta["request"]["compile"]["target_id"], first.task_id
+    ) == {"outputs": []}
     assert (await service.compile.get_config(TO, ctx))[field] == first.created_at
     assert (await store.list_summaries(ctx.account_id))[0][field] == first.created_at
     request = CompileRequest.model_validate({"from": [SRC], "to": TO, "skill": SKILL})
@@ -190,6 +194,7 @@ async def test_first_compile_created_at(service, compile_task):
         )
     operation = await store.get_operation(ctx.account_id, target_id, scheduled.task_id)
     assert operation["operation_type"] == "schedule_compile"
+    assert await store.get_outputs(ctx.account_id, target_id, scheduled.task_id) == {"outputs": []}
     async with store.edit(ctx.account_id, target_id) as record:
         record.pop(field)
     await service.compile.create(request, **params)
@@ -360,7 +365,7 @@ async def test_cancel_waits_for_output_lock_before_releasing_target(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["commit", "reindex", "git_disabled"])
+@pytest.mark.parametrize("failure", ["commit", "reindex", "outputs", "git_disabled"])
 async def test_finish_commits_then_reindexes_and_resumes(
     service, monkeypatch, compile_task, failure
 ):
@@ -378,8 +383,13 @@ async def test_finish_commits_then_reindexes_and_resumes(
     lifecycle = compile_service.lifecycle
     commit_spy = AsyncMock(wraps=lifecycle._commit)
     monkeypatch.setattr(lifecycle, "_commit", commit_spy)
+    merge_outputs = lifecycle.store.merge_outputs
     if failure == "commit":
         commit_spy.side_effect = OSError("commit failed")
+    elif failure == "outputs":
+        monkeypatch.setattr(
+            lifecycle.store, "merge_outputs", AsyncMock(side_effect=OSError("outputs failed"))
+        )
     else:
         service.reindex.side_effect = OSError("reindex failed")
     snapshot = ExternalTaskSnapshot(status="completed", meta={"commit_oid": "ignored"})
@@ -396,6 +406,7 @@ async def test_finish_commits_then_reindexes_and_resumes(
     else:
         assert run["snapshot_committed"] is True
     commit_spy.side_effect = None
+    monkeypatch.setattr(lifecycle.store, "merge_outputs", merge_outputs)
     service.reindex.side_effect = None
     await compile_service.on_finish(task, snapshot)
     await compile_service.on_finish(task, snapshot)
@@ -410,6 +421,11 @@ async def test_finish_commits_then_reindexes_and_resumes(
     }
     run = (await compile_service.list_operations(TO, ctx, limit=1, cursor=None))["operations"][0]
     assert run["status"] == "completed" and run["reindex_task_id"] == kwargs["task_id"]
+    outputs = await compile_service.operation_outputs(TO, task.task_id, ctx, limit=10, cursor=None)
+    assert len(outputs["outputs"]) == 1
+    if failure == "git_disabled":
+        assert outputs["versions_available"] is False
+        assert outputs["outputs"][0]["version_id"] is None
     if failure != "git_disabled":
         versions = await compile_service.file_versions(f"{TO}/page.md", ctx, limit=5, before=None)
         assert sum(v["source"] == "compile" for v in versions["versions"]) == 1
@@ -498,6 +514,15 @@ async def test_unsuccessful_compile_preserves_ordinary_versions(
     assert await service.viking_fs.read_file(f"{TO}/compile-only.md", ctx=ctx) == "before"
     assert await service.viking_fs.read_file(f"{TO}/last.md", ctx=ctx) == "ordinary last"
     assert not await service.viking_fs.exists(f"{TO}/new.md", ctx=ctx)
+    outputs = await service.compile.operation_outputs(TO, task.task_id, ctx, limit=100, cursor=None)
+    assert {item["uri"] for item in outputs["outputs"]} == {
+        f"{TO}/{name}" for name in ("page.md", "ordinary-new.md", "compile-only.md", "new.md")
+    }
+    for item in outputs["outputs"]:
+        assert await service.viking_fs.show(item["snapshot_id"], path=item["uri"], ctx=ctx) in (
+            b"compiled",
+            b"before",
+        )
     service.reindex.assert_not_awaited()
 
 
@@ -528,6 +553,10 @@ async def test_finish_compares_final_content(
         await service.compile.on_finish(task, ExternalTaskSnapshot(status="completed"))
     history = (await service.compile.file_versions(uri, ctx, limit=10, before=None))["versions"]
     assert history[0]["source"] == latest_source
+    outputs = await service.compile.operation_outputs(TO, task.task_id, ctx, limit=10, cursor=None)
+    assert len(outputs["outputs"]) == (1 if latest_source == "compile" else 0)
+    if outputs["outputs"]:
+        assert outputs["outputs"][0]["version_id"] == history[0]["version_id"]
     assert history[-2:] == before["versions"]
     assert len(history) == (3 if latest_source == "compile" else 2)
     final = edits[-1][1]
@@ -730,6 +759,33 @@ async def test_versions_edit_and_single_file_restore(service, monkeypatch):
     assert [item["status"] for item in restores] == ["completed", "completed", "failed"]
     assert restores[0]["result"]["result"] == "noop"
     assert sum(item["operation_type"] == "manual_revise" for item in operations) == 1
+    for operation, count in zip(restores, (0, 1, 0), strict=True):
+        outputs = await service.compile.operation_outputs(
+            TO, operation["operation_id"], ctx, limit=10, cursor=None
+        )
+        assert len(outputs["outputs"]) == count
+        for item in outputs["outputs"]:
+            assert item["version_id"] == "v4"
+            assert (
+                await service.viking_fs.show(item["snapshot_id"], path=item["uri"], ctx=ctx)
+                == b"v1"
+            )
+    manual = next(item for item in operations if item["operation_type"] == "manual_revise")
+    frozen = await service.compile.operation_outputs(
+        TO, manual["operation_id"], ctx, limit=10, cursor=None
+    )
+    monkeypatch.setattr("openviking.service.compile_targets.MAX_VERSIONS", 1)
+    monkeypatch.setattr(ContentWriteCoordinator, "_enqueue_lock_coordinator", enqueue)
+    await service.fs.write(page, "latest", ctx, wait=True)
+    await service.fs.mv(page, f"{TO}/moved.md", ctx)
+    assert (
+        await service.compile.operation_outputs(
+            TO, manual["operation_id"], ctx, limit=10, cursor=None
+        )
+        == frozen
+    )
+    (item,) = frozen["outputs"]
+    assert await service.viking_fs.show(item["snapshot_id"], path=item["uri"], ctx=ctx) == b"edited"
 
 
 @pytest.mark.asyncio
@@ -823,7 +879,8 @@ async def test_moving_and_removing_target_keeps_registry_consistent(service):
 
 
 @pytest.mark.asyncio
-async def test_operation_history_batch_and_restore(service, client, monkeypatch):
+@pytest.mark.parametrize("restore_scope", ["target", "account"])
+async def test_operation_history_batch_and_restore(service, client, monkeypatch, restore_scope):
     """A call has one scoped record per target, including noops, failures and restores."""
     ctx = RequestContext(user=UserIdentifier("default", "test_user"), role=Role.ROOT)
     store = service.compile.lifecycle.store
@@ -839,18 +896,52 @@ async def test_operation_history_batch_and_restore(service, client, monkeypatch)
     assert (await service.compile.list_operations(targets[0], ctx, limit=10, cursor=None))[
         "operations"
     ] == []
+    for write in writes:
+        write["content"] = "agent"
+    writes.append({"uri": f"{targets[0]}/second.md", "content": "extra"})
+    commit = AsyncMock(wraps=service.compile.lifecycle.versions._commit)
+    monkeypatch.setattr(service.compile.lifecycle.versions, "_commit", commit)
     await service.fs.batch_write(
         root_uri=root, operations=writes, ctx=ctx, defer_processing=True, edit_source="agent"
     )
+    commit.assert_awaited_once()
     pages = [
         await service.compile.list_operations(to, ctx, limit=10, cursor=None) for to in targets
     ]
     for page, uri in zip(pages, uris, strict=True):
         (operation,) = page["operations"]
         assert operation["operation_type"] == "agent_revise"
-        assert operation["params"]["uris"] == [uri]
         assert operation["result"]["updated"] == [uri]
+        outputs = await service.compile.operation_outputs(
+            uri.rsplit("/", 1)[0], operation["operation_id"], ctx, limit=10, cursor=None
+        )
+        assert all(
+            item["uri"].startswith(uri.rsplit("/", 1)[0] + "/") for item in outputs["outputs"]
+        )
+        assert all(item["version_id"] == "v1" for item in outputs["outputs"])
+        assert len({item["snapshot_id"] for item in outputs["outputs"]}) == 1
     assert pages[0]["operations"][0]["operation_id"] == pages[1]["operations"][0]["operation_id"]
+    operation_id = pages[0]["operations"][0]["operation_id"]
+    endpoint = f"/api/v1/compile/operations/{operation_id}/outputs"
+    response = await client.get(endpoint, params={"to": targets[0], "limit": 1})
+    assert response.status_code == 200, response.text
+    first_output = response.json()["result"]
+    response = await client.get(
+        endpoint, params={"to": targets[0], "cursor": first_output["next_cursor"]}
+    )
+    assert len(response.json()["result"]["outputs"]) == 1
+    assert first_output["outputs"][0]["uri"] != response.json()["result"]["outputs"][0]["uri"]
+    assert (await client.get(endpoint, params={"to": SRC})).status_code == 404
+    from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
+
+    with pytest.raises(InvalidArgumentError):
+        await service.compile.operation_outputs(targets[0], "../escape", ctx, limit=10, cursor=None)
+    foreign = RequestContext(user=UserIdentifier("foreign", "test_user"), role=Role.ROOT)
+    with pytest.raises(NotFoundError):
+        await service.compile.operation_outputs(
+            targets[0], operation_id, foreign, limit=10, cursor=None
+        )
+
     for _ in range(2):
         await service.fs.write(uris[0], "manual", ctx, edit_source="manual", wait=True)
     updated_at = (await service.compile.get_config(targets[0], ctx))["content_updated_at"]
@@ -870,16 +961,25 @@ async def test_operation_history_batch_and_restore(service, client, monkeypatch)
     monkeypatch.setattr(
         service.viking_fs, "_schedule_restore_reindex_for_paths", AsyncMock(return_value=None)
     )
+    restore_to = targets[0] if restore_scope == "target" else None
     await service.fs.restore(
-        project_dir=targets[0], source_commit=snapshot["commit_oid"], ctx=ctx, dry_run=True
+        project_dir=restore_to, source_commit=snapshot["commit_oid"], ctx=ctx, dry_run=True
     )
-    await service.fs.restore(project_dir=targets[0], source_commit=snapshot["commit_oid"], ctx=ctx)
+    await service.fs.restore(project_dir=restore_to, source_commit=snapshot["commit_oid"], ctx=ctx)
     assert await service.viking_fs.read_file(uris[0], ctx=ctx) == "original"
     assert (await service.compile.get_config(targets[0], ctx))["content_updated_at"] > updated_at
     operations = (await service.compile.list_operations(targets[0], ctx, limit=10, cursor=None))[
         "operations"
     ]
     assert len(operations) == 4 and operations[0]["operation_type"] == "restore"
+    outputs = await service.compile.operation_outputs(
+        targets[0], operations[0]["operation_id"], ctx, limit=10, cursor=None
+    )
+    (item,) = outputs["outputs"]
+    assert item["uri"] == uris[0] and item["version_id"] is not None
+    assert (
+        await service.viking_fs.show(item["snapshot_id"], path=item["uri"], ctx=ctx) == b"original"
+    )
     for failure, status in [
         (RuntimeError("write failed"), "failed"),
         (asyncio.CancelledError(), "cancelled"),
@@ -892,3 +992,47 @@ async def test_operation_history_batch_and_restore(service, client, monkeypatch)
         ][0]
         assert latest["operation_type"] == "agent_revise" and latest["status"] == status
         assert latest["finished_at"] is not None and latest["conflicts_num"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError("write failed"), asyncio.CancelledError()])
+async def test_batch_outputs_preserve_partial_writes(service, compile_task, monkeypatch, failure):
+    """A failed batch versions its successful writes once before releasing content locks."""
+    ctx, _ = compile_task
+    write = ContentWriteCoordinator._write_in_place
+
+    async def fail_second(self, uri, *args, **kwargs):
+        if uri.endswith("bad.md"):
+            raise failure
+        return await write(self, uri, *args, **kwargs)
+
+    monkeypatch.setattr(ContentWriteCoordinator, "_write_in_place", fail_second)
+    with pytest.raises(type(failure)):
+        await service.fs.batch_write(
+            root_uri=TO,
+            ctx=ctx,
+            edit_source="manual",
+            defer_processing=True,
+            operations=[
+                {"uri": f"{TO}/{name}.md", "content": name.split("_", 1)[1]}
+                for name in ("01_good", "02_bad", "03_unwritten")
+            ],
+        )
+    operation = (await service.compile.list_operations(TO, ctx, limit=1, cursor=None))[
+        "operations"
+    ][0]
+    outputs = await service.compile.operation_outputs(
+        TO, operation["operation_id"], ctx, limit=10, cursor=None
+    )
+    (item,) = outputs["outputs"]
+    assert item["uri"] == f"{TO}/01_good.md" and item["version_id"] == "v1"
+    assert await service.viking_fs.show(item["snapshot_id"], path=item["uri"], ctx=ctx) == b"good"
+    store = service.compile.lifecycle.store
+    target = await store.get_by_to(ctx.account_id, TO)
+    await store.remove(store._outputs_path(ctx.account_id, target["id"], operation["operation_id"]))
+    from openviking_cli.exceptions import NotFoundError
+
+    with pytest.raises(NotFoundError, match="not recorded"):
+        await service.compile.operation_outputs(
+            TO, operation["operation_id"], ctx, limit=10, cursor=None
+        )

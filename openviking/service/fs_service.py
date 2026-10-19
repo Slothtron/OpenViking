@@ -1334,6 +1334,11 @@ class FSService:
             viking_fs=viking_fs,
             vikingdb=self._vikingdb,
             privacy_sanitizer=self._privacy_sanitizer,
+            commit_batch=(
+                partial(self.compile_versions.finish_batch, ctx=ctx, edit_source=edit_source)
+                if self.compile_versions is not None and edit_source != "compile"
+                else None
+            ),
             commit_content=(
                 partial(
                     self.compile_versions.record_write,
@@ -1455,6 +1460,11 @@ class FSService:
             author_name=author_name,
             author_email=author_email,
             ctx=ctx,
+            record_restore=(
+                partial(self.compile_versions.record_restored, ctx=ctx)
+                if self.compile_versions is not None and not dry_run
+                else None
+            ),
         )
         if self.compile_versions is None or dry_run:
             return await restore()

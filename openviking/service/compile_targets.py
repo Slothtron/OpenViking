@@ -4,7 +4,8 @@
 
 State lives under ``/local/{account}/_system/compile/``: ``target_folders.json``
 (summary index), ``target_folders/{id}/state.json`` (source of truth),
-``target_folders/{id}/operations/{operation_id}.json`` (one record per directory operation) and
+``target_folders/{id}/operations/{operation_id}.json`` (one record per directory operation),
+``target_folders/{id}/operation_outputs/{operation_id}.json`` (immutable-path version references), and
 ``target_folders/{id}/file_versions/{sha256(uri)}.json`` (one version index per output
 file). Each JSON's read-modify-write takes its own PathLock, so the layout stays
 consistent across instances when PathLock uses the cache provider.
@@ -22,11 +23,14 @@ import asyncio
 import hashlib
 import json
 import random
+import sys
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import (
     Annotated,
     Any,
+    AsyncContextManager,
     AsyncIterator,
     Awaitable,
     Callable,
@@ -35,6 +39,7 @@ from typing import (
     Literal,
     Mapping,
     Optional,
+    Protocol,
     Union,
 )
 from uuid import uuid4
@@ -64,6 +69,9 @@ from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
+
+# Per-call references are collected in memory and persisted once before terminal status.
+_operation_outputs: ContextVar[Optional[dict]] = ContextVar("operation_outputs", default=None)
 
 
 # ==========================================================================
@@ -125,6 +133,65 @@ def summarize(record: Dict[str, Any]) -> Dict[str, Any]:
     return summary
 
 
+class CompileStore(Protocol):
+    """Target, operation and version-index persistence used by Compile.
+
+    Edits save on clean exit. Object locks serialize their read-modify-write
+    scopes; lock tokens are opaque and belong to the selected implementation.
+    """
+
+    async def register(self, account_id: str, to: str) -> str: ...
+    async def find_id(self, account_id: str, to: str) -> Optional[str]: ...
+    async def get(self, account_id: str, target_id: str) -> Optional[Dict[str, Any]]: ...
+    async def get_by_to(self, account_id: str, to: str) -> Optional[Dict[str, Any]]: ...
+    def edit(self, account_id: str, target_id: str) -> AsyncContextManager[Dict[str, Any]]: ...
+    async def list_summaries(self, account_id: str) -> List[Dict[str, Any]]: ...
+    async def list_accounts(self) -> List[str]: ...
+    async def mark_content_updated(self, account_id: str, target_id: str) -> None: ...
+
+    async def get_operation(
+        self, account_id: str, target_id: str, operation_id: str
+    ) -> Optional[Dict[str, Any]]: ...
+    async def put_operation(
+        self, account_id: str, target_id: str, operation: Dict[str, Any]
+    ) -> None: ...
+    async def list_operations(self, account_id: str, target_id: str) -> List[Dict[str, Any]]: ...
+    def lock_operation(
+        self,
+        account_id: str,
+        target_id: str,
+        operation_id: str,
+        phase: Literal["create", "finish"],
+    ) -> AsyncContextManager[None]: ...
+    async def get_outputs(
+        self, account_id: str, target_id: str, operation_id: str
+    ) -> Optional[dict]: ...
+    async def merge_outputs(
+        self,
+        account_id: str,
+        target_id: str,
+        operation_id: str,
+        outputs: List[dict],
+        *,
+        versions_available: bool = True,
+    ) -> None: ...
+
+    async def get_version_index(
+        self, account_id: str, target_id: str, uri: str
+    ) -> Optional[Dict[str, Any]]: ...
+    async def list_version_indexes(
+        self, account_id: str, target_id: str
+    ) -> List[Dict[str, Any]]: ...
+    async def put_version_index(
+        self, account_id: str, target_id: str, index: Dict[str, Any], lock_token: Any = None
+    ) -> None: ...
+    async def delete_version_index(self, account_id: str, target_id: str, uri: str) -> None: ...
+    async def clear_version_indexes(self, account_id: str, target_id: str) -> None: ...
+    def lock_version_index(
+        self, account_id: str, target_id: str, uri: str, inherited_lock: Any = None
+    ) -> AsyncContextManager[Any]: ...
+
+
 class CompileStateStore:
     """JSON persistence for Compile targets; all writes take the file's PathLock."""
 
@@ -158,23 +225,27 @@ class CompileStateStore:
             return None
         return json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
 
-    async def _ensure_parent(self, path: str) -> None:
+    async def _ensure_parent(self, path: str, fs_ctx: Any = None) -> None:
         try:
-            await self._agfs.ensure_parent_dirs(path)
+            await self._agfs.ensure_parent_dirs(path, fs_ctx=fs_ctx)
         except AGFSAlreadyExistsError:
             pass
 
     async def write_json(self, path: str, value: Any, lease: Any = None) -> None:
         """Write JSON; pass the held lease when ``path`` is already locked by the caller."""
-        await self._ensure_parent(path)
         fs_ctx = fs_ctx_from_agfs_path(path)
         if lease is not None:
             fs_ctx["lease_ref"] = lease["lease_ref"]
+        await self._ensure_parent(path, fs_ctx)
         data = json.dumps(value, ensure_ascii=False).encode("utf-8")
         await self._agfs.write(path, data, fs_ctx=fs_ctx)
 
     @asynccontextmanager
-    async def locked(self, path: str) -> AsyncIterator[Any]:
+    async def locked(self, path: str, inherited_lease: Any = None) -> AsyncIterator[Any]:
+        """Lock a JSON path, or reuse a caller-owned tree lease covering that path."""
+        if inherited_lease is not None:
+            yield inherited_lease
+            return
         await self._ensure_parent(path)
         lease = await self._agfs.pathlock_acquire_exact(path, timeout_secs=LOCK_TIMEOUT_SECONDS)
         try:
@@ -261,6 +332,54 @@ class CompileStateStore:
             self._operation_path(account_id, target_id, operation["operation_id"]), operation
         )
 
+    @asynccontextmanager
+    async def lock_operation(
+        self,
+        account_id: str,
+        target_id: str,
+        operation_id: str,
+        phase: Literal["create", "finish"],
+    ) -> AsyncIterator[None]:
+        """Serialize one operation phase; creation and finalization use separate locks."""
+        async with self.locked(
+            f"{self._operation_path(account_id, target_id, operation_id)}.{phase}"
+        ):
+            yield
+
+    def _outputs_path(self, account_id: str, target_id: str, operation_id: str) -> str:
+        return f"{self._target_dir(account_id, target_id)}/operation_outputs/{operation_id}.json"
+
+    async def get_outputs(
+        self, account_id: str, target_id: str, operation_id: str
+    ) -> Optional[dict]:
+        path = self._outputs_path(account_id, target_id, operation_id)
+        async with self.locked(path):
+            return await self.read_json(path)
+
+    async def merge_outputs(
+        self,
+        account_id: str,
+        target_id: str,
+        operation_id: str,
+        outputs: List[dict],
+        *,
+        versions_available: bool = True,
+    ) -> None:
+        """Persist one reference per output URI; retries preserve already recorded outputs.
+
+        Null version/snapshot references indicate unavailable versions. URI paths
+        stay fixed at production time so moving a live file cannot change history.
+        """
+        path = self._outputs_path(account_id, target_id, operation_id)
+        async with self.locked(path) as lease:
+            data = await self.read_json(path) or {"outputs": []}
+            merged = {item["uri"]: item for item in data["outputs"]}
+            merged.update((item["uri"], item) for item in outputs)
+            data["outputs"] = [merged[uri] for uri in sorted(merged)]
+            if not versions_available or any(item["snapshot_id"] is None for item in outputs):
+                data["versions_available"] = False
+            await self.write_json(path, data, lease)
+
     async def list_dir(self, directory: str) -> List[str]:
         """JSON file names in ``directory``; empty when it does not exist."""
         try:
@@ -304,6 +423,60 @@ class CompileStateStore:
             and entry.get("name") != "_system"
             and entry.get("isDir", entry.get("is_dir", False))
         ]
+
+    # ---------- file version indexes ----------
+
+    def _versions_dir(self, account_id: str, target_id: str) -> str:
+        return f"{self._target_dir(account_id, target_id)}/file_versions"
+
+    def _version_path(self, account_id: str, target_id: str, uri: str) -> str:
+        name = hashlib.sha256(uri.encode("utf-8")).hexdigest()
+        return f"{self._versions_dir(account_id, target_id)}/{name}.json"
+
+    async def get_version_index(
+        self, account_id: str, target_id: str, uri: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read the stored index for an output URI, or None if it is absent."""
+        return await self.read_json(self._version_path(account_id, target_id, uri))
+
+    async def list_version_indexes(self, account_id: str, target_id: str) -> List[Dict[str, Any]]:
+        """Read the target's existing indexes, ignoring files removed during enumeration."""
+        directory = self._versions_dir(account_id, target_id)
+        indexes = []
+        for name in await self.list_dir(directory):
+            index = await self.read_json(f"{directory}/{name}")
+            if index is not None:
+                indexes.append(index)
+        return indexes
+
+    async def put_version_index(
+        self, account_id: str, target_id: str, index: Dict[str, Any], lock_token: Any = None
+    ) -> None:
+        """Save the index at its URI, using the caller's version lock when supplied."""
+        await self.write_json(
+            self._version_path(account_id, target_id, index["uri"]), index, lock_token
+        )
+
+    async def delete_version_index(self, account_id: str, target_id: str, uri: str) -> None:
+        """Remove an output's index; a missing index is already deleted."""
+        await self.remove(self._version_path(account_id, target_id, uri))
+
+    async def clear_version_indexes(self, account_id: str, target_id: str) -> None:
+        """Remove a target's version indexes while preserving operations and output references."""
+        await self.remove(self._versions_dir(account_id, target_id), recursive=True)
+
+    @asynccontextmanager
+    async def lock_version_index(
+        self, account_id: str, target_id: str, uri: str, inherited_lock: Any = None
+    ) -> AsyncIterator[Any]:
+        """Lock an index, reusing a covering content lock during whole-account restore.
+
+        Pass the yielded opaque token to put_version_index while this scope is held.
+        """
+        async with self.locked(
+            self._version_path(account_id, target_id, uri), inherited_lock
+        ) as token:
+            yield token
 
 
 # ==========================================================================
@@ -455,7 +628,7 @@ def new_compile_operation(task: Any, record: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class CompileLifecycle:
-    def __init__(self, store: CompileStateStore, viking_fs: Any) -> None:
+    def __init__(self, store: CompileStore, viking_fs: Any) -> None:
         self.store = self._store = store
         self._fs = viking_fs
         self.versions = CompileVersions(store, viking_fs)
@@ -599,13 +772,17 @@ class CompileLifecycle:
     async def record_queued(self, task: Any) -> None:
         """Persist the Compile operation before execution; retries reuse its task identity."""
         meta = task.meta["request"]["compile"]
-        path = self._store._operation_path(task.account_id, meta["target_id"], task.task_id)
-        async with self._store.locked(path + ".create"):
+        async with self._store.lock_operation(
+            task.account_id, meta["target_id"], task.task_id, "create"
+        ):
             run = await self._store.get_operation(task.account_id, meta["target_id"], task.task_id)
             if run is None:
                 # Scheduled submissions hold the target lock and follow an initialized Compile.
                 if meta["trigger"] != "scheduled":
                     await self.record_created(task)
+                await self._store.merge_outputs(
+                    task.account_id, meta["target_id"], task.task_id, []
+                )
                 await self._store.put_operation(
                     task.account_id,
                     meta["target_id"],
@@ -746,9 +923,7 @@ class CompileLifecycle:
         if meta is None:
             return snapshot
         account_id, target_id = task.account_id, meta["target_id"]
-        async with self._store.locked(
-            self._store._operation_path(account_id, target_id, task.task_id) + ".finish"
-        ):
+        async with self._store.lock_operation(account_id, target_id, task.task_id, "finish"):
             run = await self._store.get_operation(account_id, target_id, task.task_id)
             if run is not None and run["finished_at"] is None:
                 ctx = task_ctx(task.account_id, task.user_id)
@@ -894,6 +1069,21 @@ class CompileLifecycle:
                     for uri, index in indexes.items()
                     if (version := self.versions._ordinary_version(index, run["task_id"]))
                 }
+                await self.versions.record_compile(
+                    ctx.account_id,
+                    await self._store.get(ctx.account_id, target_id),
+                    run,
+                    head,
+                    [
+                        {"uri": uri, "change_type": change}
+                        for uri, change in changes.items()
+                        if change != "deleted"
+                    ],
+                )
+                indexes = {
+                    index["uri"]: index
+                    for index in await self.versions._indexes(ctx.account_id, target_id)
+                }
                 changed = False
                 for uri in changes.keys() | ordinary.keys():
                     version = ordinary.get(uri)
@@ -921,12 +1111,11 @@ class CompileLifecycle:
                     ]
                     if retained == index["versions"]:
                         continue
-                    path = self.versions._path(ctx.account_id, target_id, uri)
                     if retained:
                         index["versions"] = retained
-                        await self._store.write_json(path, index)
+                        await self._store.put_version_index(ctx.account_id, target_id, index)
                     else:
-                        await self._store.remove(path)
+                        await self._store.delete_version_index(ctx.account_id, target_id, uri)
                 run["target_head"] = await self._commit(
                     [to], f"compile {run['task_id']} rollback", ctx, lease_ref=lease
                 )
@@ -1027,7 +1216,7 @@ def is_versioned(uri: str) -> bool:
 class CompileVersions:
     """Version metadata preserves ordinary edits across Compile retries and rollback."""
 
-    def __init__(self, store: CompileStateStore, viking_fs: Any) -> None:
+    def __init__(self, store: CompileStore, viking_fs: Any) -> None:
         self._store = store
         self._fs = viking_fs
         # Installed by CompileScheduler: async (account_id, record) -> None.
@@ -1035,19 +1224,14 @@ class CompileVersions:
 
     # ---------- index storage ----------
 
-    def _dir(self, account_id: str, target_id: str) -> str:
-        return f"{self._store.root(account_id)}/target_folders/{target_id}/file_versions"
-
-    def _path(self, account_id: str, target_id: str, uri: str) -> str:
-        name = hashlib.sha256(uri.encode("utf-8")).hexdigest()
-        return f"{self._dir(account_id, target_id)}/{name}.json"
-
     async def load(self, account_id: str, target_id: str, uri: str) -> Optional[Dict[str, Any]]:
-        return await self._read_index(self._path(account_id, target_id, uri))
+        return self._normalize_index(
+            await self._store.get_version_index(account_id, target_id, uri)
+        )
 
-    async def _read_index(self, path: str) -> Optional[Dict[str, Any]]:
-        """Read normalized metadata from path, or return None if absent."""
-        index = await self._store.read_json(path)
+    @staticmethod
+    def _normalize_index(index: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Normalize legacy metadata in memory without changing persisted versions on read."""
         if index is not None:
             index.pop("source_roots", None)
             for version in index["versions"]:
@@ -1059,13 +1243,10 @@ class CompileVersions:
         return index
 
     async def _indexes(self, account_id: str, target_id: str) -> List[Dict[str, Any]]:
-        directory = self._dir(account_id, target_id)
-        indexes = []
-        for name in await self._store.list_dir(directory):
-            index = await self._read_index(f"{directory}/{name}")
-            if index is not None:
-                indexes.append(index)
-        return indexes
+        return [
+            self._normalize_index(index)
+            for index in await self._store.list_version_indexes(account_id, target_id)
+        ]
 
     async def append(
         self,
@@ -1074,22 +1255,60 @@ class CompileVersions:
         uri: str,
         snapshot_id: str,
         entry: Dict[str, Any],
+        *,
+        operation_id: Optional[str] = None,
+        metadata_lease: Any = None,
     ) -> Dict[str, Any]:
-        """Append with metadata defaults under a file lock; retain MAX_VERSIONS."""
-        path = self._path(account_id, target_id, uri)
-        async with self._store.locked(path) as lease:
-            index = await self._read_index(path) or {"uri": uri, "next": 1, "versions": []}
-            version = {
-                "version_id": f"v{index['next']}",
-                "snapshot_id": snapshot_id,
-                "snapshot_path": uri,
-                "created_at": time.time(),
-                **entry,
-                "meta": {**_VERSION_META_DEFAULTS, **entry.get("meta", {})},
+        """Append a file version under its lock, reusing a version on operation retries.
+
+        A whole-account restore supplies its covering lease for version metadata.
+        Independent operations collect exact references before publishing completion.
+        """
+        context = _operation_outputs.get()
+        collecting = (
+            context and context["account_id"] == account_id and target_id in context["outputs"]
+        )
+        operation_id = operation_id or (context["operation_id"] if collecting else None)
+        async with self._store.lock_version_index(
+            account_id, target_id, uri, metadata_lease
+        ) as token:
+            index = await self.load(account_id, target_id, uri) or {
+                "uri": uri,
+                "next": 1,
+                "versions": [],
             }
-            index["next"] += 1
-            index["versions"] = (index["versions"] + [version])[-MAX_VERSIONS:]
-            await self._store.write_json(path, index, lease)
+            version = next(
+                (
+                    v
+                    for v in index["versions"]
+                    if operation_id and v["meta"].get("operation_id") == operation_id
+                ),
+                None,
+            )
+            if version is None:
+                version = {
+                    "version_id": f"v{index['next']}",
+                    "snapshot_id": snapshot_id,
+                    "snapshot_path": uri,
+                    "created_at": time.time(),
+                    **entry,
+                    "meta": {**_VERSION_META_DEFAULTS, **entry.get("meta", {})},
+                }
+                if operation_id:
+                    version["meta"]["operation_id"] = operation_id
+                index["next"] += 1
+                index["versions"] = (index["versions"] + [version])[-MAX_VERSIONS:]
+
+            async def persist():
+                await self._store.put_version_index(account_id, target_id, index, token)
+                if collecting and operation_id == context["operation_id"]:
+                    context["outputs"][target_id][uri] = {
+                        "uri": uri,
+                        "version_id": version["version_id"],
+                        "snapshot_id": version["snapshot_id"],
+                    }
+
+            await run_to_completion(persist)
         return version
 
     # ---------- target resolution ----------
@@ -1145,9 +1364,17 @@ class CompileVersions:
             await self._fs._ensure_access(
                 uri, ctx, action=AclAction.READ if recursive else AclAction.WRITE
             )
+        context = {
+            "account_id": ctx.account_id,
+            "operation_id": operation_id,
+            "outputs": {target["id"]: {} for target, _ in entries},
+            "changed": set(),
+        }
+        token = _operation_outputs.set(context)
         outcome = {}
         try:
             for target, entry in entries:
+                await self._store.merge_outputs(ctx.account_id, target["id"], operation_id, [])
                 await self._store.put_operation(ctx.account_id, target["id"], entry)
             result = await operation()
         except BaseException as exc:
@@ -1166,9 +1393,16 @@ class CompileVersions:
                 entry["status"] = "completed"
             return result
         finally:
+            _operation_outputs.reset(token)
 
             async def finish():
                 for target, entry in entries:
+                    await self._store.merge_outputs(
+                        ctx.account_id,
+                        target["id"],
+                        operation_id,
+                        list(context["outputs"][target["id"]].values()),
+                    )
                     entry["finished_at"] = time.time()
                     entry["result"] = {
                         key: outcome[key]
@@ -1200,11 +1434,21 @@ class CompileVersions:
 
             try:
                 await run_to_completion(finish)
-            except Exception:
-                if any(entry["status"] != "completed" for _, entry in entries):
-                    logger.exception("Failed to persist operation outcome %s", operation_id)
-                else:
+            except Exception as exc:
+                completed = all(entry["status"] == "completed" for _, entry in entries)
+                for target, entry in entries:
+                    if entry["status"] == "completed":
+                        entry.update(
+                            status="failed", error=f"Failed to persist operation outputs: {exc}"
+                        )
+                    entry["finished_at"] = time.time()
+                    try:
+                        await self._store.put_operation(ctx.account_id, target["id"], entry)
+                    except Exception:
+                        logger.exception("Failed to persist operation failure %s", operation_id)
+                if completed:
                     raise
+                logger.exception("Failed to persist operation outcome %s", operation_id)
 
     async def _managed(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
         record = await self.owning_target(ctx.account_id, uri)
@@ -1237,6 +1481,9 @@ class CompileVersions:
         incremental runs extend the latest version's provenance with changed roots.
         """
         if not head:
+            await self._store.merge_outputs(
+                account_id, record["id"], run["operation_id"], [], versions_available=False
+            )
             return
         indexes = {index["uri"]: index for index in await self._indexes(account_id, record["id"])}
         ordinary = {
@@ -1246,57 +1493,98 @@ class CompileVersions:
         }
         changes = {change["uri"]: change["change_type"] for change in changes}
         full = run["params"]["args"]["mode"] == "full"
-        # Ordinary edits can differ even when final output matches the start snapshot.
-        for uri in changes.keys() | ordinary.keys():
-            if not is_versioned(uri):
-                continue
-            index, version = indexes.get(uri), ordinary.get(uri)
-            change_type = changes.get(uri, "modified")
-            if version:
-                if version["meta"]["after_compile_snapshot"]:
+        manifest = await self._store.get_outputs(account_id, record["id"], run["operation_id"])
+        outputs = list((manifest or {}).get("outputs", [])) + [
+            {
+                "uri": version["snapshot_path"],
+                "version_id": version["version_id"],
+                "snapshot_id": version["snapshot_id"],
+            }
+            for index in indexes.values()
+            for version in index["versions"]
+            if version["source"] == "compile" and version["meta"]["task_id"] == run["task_id"]
+        ]
+        recorded = {item["uri"] for item in outputs if item["snapshot_id"] is not None}
+        try:
+            # Ordinary edits can differ even when final output matches the start snapshot.
+            for uri in changes.keys() | ordinary.keys():
+                if not is_versioned(uri):
                     continue
-                if change_type != "deleted":
-                    try:
-                        if not await self._changed(account_id, record["id"], uri, head):
-                            continue
-                    except (AGFSNotFoundError, NotFoundError):
-                        change_type = "deleted"
-            if change_type == "deleted":
-                if version is None:
-                    await self._store.remove(self._path(account_id, record["id"], uri))
-                continue
-            if index and any(
-                v["meta"]["task_id"] == run["task_id"] and v["source"] == "compile"
-                for v in index["versions"]
-            ):
-                continue
-            if full or not (index or {}).get("versions"):
-                roots = list(run["params"]["from"])
-            else:
-                previous_roots = index["versions"][-1].get("provenance", {}).get("source_roots", [])
-                roots = sorted(set(previous_roots) | set(run["changed_roots"]))
-            await self.append(
-                account_id,
-                record["id"],
-                uri,
-                head,
-                {
-                    "source": "compile",
-                    "actor": run["actor"],
-                    "meta": {"task_id": run["task_id"]},
-                    "provenance": {
-                        "trigger": run["trigger"],
-                        "skill": run["params"]["skill"],
-                        "source_roots": roots,
+                if uri in recorded:
+                    continue
+                index, version = indexes.get(uri), ordinary.get(uri)
+                change_type = changes.get(uri, "modified")
+                if version:
+                    if version["meta"]["after_compile_snapshot"]:
+                        continue
+                    if change_type != "deleted":
+                        try:
+                            if not await self._changed(account_id, record["id"], uri, head):
+                                continue
+                        except (AGFSNotFoundError, NotFoundError):
+                            change_type = "deleted"
+                if change_type == "deleted":
+                    if version is None:
+                        await self._store.delete_version_index(account_id, record["id"], uri)
+                    continue
+                if index and any(
+                    v["meta"]["task_id"] == run["task_id"] and v["source"] == "compile"
+                    for v in index["versions"]
+                ):
+                    continue
+                if full or not (index or {}).get("versions"):
+                    roots = list(run["params"]["from"])
+                else:
+                    previous_roots = (
+                        index["versions"][-1].get("provenance", {}).get("source_roots", [])
+                    )
+                    roots = sorted(set(previous_roots) | set(run["changed_roots"]))
+                created = await self.append(
+                    account_id,
+                    record["id"],
+                    uri,
+                    head,
+                    {
+                        "source": "compile",
+                        "actor": run["actor"],
+                        "meta": {"task_id": run["task_id"]},
+                        "provenance": {
+                            "trigger": run["trigger"],
+                            "skill": run["params"]["skill"],
+                            "source_roots": roots,
+                        },
                     },
-                },
-            )
+                    operation_id=run["operation_id"],
+                )
+                outputs.append(
+                    {
+                        "uri": uri,
+                        "version_id": created["version_id"],
+                        "snapshot_id": created["snapshot_id"],
+                    }
+                )
+        finally:
+            error = sys.exc_info()[1]
+            try:
+                await run_to_completion(
+                    lambda: self._store.merge_outputs(
+                        account_id, record["id"], run["operation_id"], outputs
+                    )
+                )
+            except BaseException:
+                if error is None:
+                    raise
+                logger.exception("Failed to persist Compile outputs for %s", run["operation_id"])
 
     @staticmethod
     def _ordinary_version(index: Optional[Dict[str, Any]], task_id: str) -> Optional[dict]:
         """Return the run's latest ordinary version, or None; Compile entries are ignored."""
         for version in reversed((index or {}).get("versions", [])):
-            if version["meta"]["task_id"] == task_id and version["source"] in {"manual", "agent"}:
+            if version["meta"]["task_id"] == task_id and version["source"] in {
+                "manual",
+                "agent",
+                "restore",
+            }:
                 return version
         return None
 
@@ -1325,7 +1613,7 @@ class CompileVersions:
                 continue
             if change["change_type"] == "deleted":
                 changed = changed or await self.load(account_id, record["id"], uri) is not None
-                await self._store.remove(self._path(account_id, record["id"], uri))
+                await self._store.delete_version_index(account_id, record["id"], uri)
             elif await self._changed(account_id, record["id"], uri, target_base):
                 changed = True
                 await self.append(
@@ -1369,34 +1657,64 @@ class CompileVersions:
                     else None
                 )
         written = await write() if write is not None else None
+        changed = {}
+        context = _operation_outputs.get()
         for target_id, targets in grouped.items():
-            if write is not None:
-                for uri in targets:
-                    if previous[uri] != await self._fs.read_file_bytes(uri, ctx=ctx):
-                        await self._store.mark_content_updated(ctx.account_id, target_id)
-                        break
-            if not record_version:
+            targets = [
+                uri
+                for uri in targets
+                if write is None or previous[uri] != await self._fs.read_file_bytes(uri, ctx=ctx)
+            ]
+            if not targets:
                 continue
-            record = await self._store.get(ctx.account_id, target_id)
-            run = (
-                await self._store.get_operation(ctx.account_id, target_id, record["active_task_id"])
-                if record["active_task_id"]
-                else None
-            )
-            run_entry = {}
-            if run and run["started_at"] is not None and run["finished_at"] is None:
-                run_entry["task_id"] = run["task_id"]
-                if run.get("snapshot_committed"):
-                    run_entry["after_compile_snapshot"] = True
-            snapshot = await self._commit(targets, f"{edit_source} edit", ctx, lease_ref=lease_ref)
-            for uri in targets:
-                if snapshot and (
-                    await self._changed(ctx.account_id, target_id, uri, snapshot)
-                    or (
-                        uri in previous
-                        and previous[uri] != await self._fs.show(snapshot, path=uri, ctx=ctx)
+            changed[target_id] = targets
+            if write is not None:
+                await self._store.mark_content_updated(ctx.account_id, target_id)
+            if context and context["account_id"] == ctx.account_id:
+                context["changed"].update(targets)
+                if target_id in context["outputs"]:
+                    for uri in targets:
+                        context["outputs"][target_id][uri] = {
+                            "uri": uri,
+                            "version_id": None,
+                            "snapshot_id": None,
+                        }
+        if not record_version:
+            if edit_source == "compile":
+                for target_id, targets in changed.items():
+                    record = await self._store.get(ctx.account_id, target_id)
+                    run = (
+                        await self._store.get_operation(
+                            ctx.account_id, target_id, record["active_task_id"]
+                        )
+                        if record["active_task_id"]
+                        else None
                     )
-                ):
+                    if run and run["started_at"] is not None and run["target_base"] is None:
+                        await self._store.merge_outputs(
+                            ctx.account_id,
+                            target_id,
+                            run["operation_id"],
+                            [
+                                {"uri": uri, "version_id": None, "snapshot_id": None}
+                                for uri in targets
+                            ],
+                            versions_available=False,
+                        )
+            return written
+        if not changed:
+            return written
+        snapshot = await self._commit(
+            [uri for targets in changed.values() for uri in targets],
+            f"{edit_source} edit",
+            ctx,
+            lease_ref=lease_ref,
+        )
+        for target_id, targets in changed.items():
+            record = await self._store.get(ctx.account_id, target_id)
+            run_entry = await self._write_meta(ctx.account_id, record)
+            for uri in targets:
+                if snapshot:
                     await self.append(
                         ctx.account_id,
                         target_id,
@@ -1410,6 +1728,66 @@ class CompileVersions:
                         },
                     )
         return written
+
+    async def _write_meta(self, account_id: str, record: dict) -> dict:
+        """Keep independently written versions associated with an active Compile for rollback."""
+        run = (
+            await self._store.get_operation(account_id, record["id"], record["active_task_id"])
+            if record["active_task_id"]
+            else None
+        )
+        if run and run["started_at"] is not None and run["finished_at"] is None:
+            return {
+                "task_id": run["task_id"],
+                **({"after_compile_snapshot": True} if run.get("snapshot_committed") else {}),
+            }
+        return {}
+
+    async def finish_batch(self, *, ctx: RequestContext, edit_source: str, lease_ref: Any) -> None:
+        """Version the batch's changed files once, before its content lease is released."""
+        context = _operation_outputs.get()
+        if context and context["account_id"] == ctx.account_id and context["changed"]:
+            await self.record_write(
+                sorted(context["changed"]), ctx, edit_source, lease_ref=lease_ref
+            )
+
+    async def record_restored(
+        self,
+        result: dict,
+        *,
+        ctx: RequestContext,
+        lease_ref: Any,
+        metadata_lease: Any = None,
+    ) -> None:
+        """Version successful snapshot-restore writes under the writeback lease.
+
+        Partial failures expose only their confirmed written paths. Their new commit
+        supplies immutable bytes; deleted paths and unchanged files are not outputs.
+        """
+        context = _operation_outputs.get()
+        if context is None or context["account_id"] != ctx.account_id:
+            return
+        snapshot = result.get("new_commit_oid")
+        if not snapshot:
+            return
+        for path in result.get("written_paths", []):
+            uri = self._fs._tree_path_to_uri(path)
+            record = await self.owning_target(ctx.account_id, uri)
+            if record is None or not is_versioned(uri):
+                continue
+            await self.append(
+                ctx.account_id,
+                record["id"],
+                uri,
+                snapshot,
+                {
+                    "source": "restore",
+                    "actor": ctx.user.user_id,
+                    "provenance": {"source_roots": [uri]},
+                    "meta": await self._write_meta(ctx.account_id, record),
+                },
+                metadata_lease=metadata_lease,
+            )
 
     async def _changed(self, account_id: str, target_id: str, uri: str, snapshot: str) -> bool:
         """Whether ``uri`` in ``snapshot`` differs from its latest version's content.
@@ -1441,15 +1819,13 @@ class CompileVersions:
             uri = index["uri"]
             if uri != from_uri and not uri.startswith(f"{from_uri}/"):
                 continue
-            await self._store.remove(self._path(account_id, source["id"], uri))
+            await self._store.delete_version_index(account_id, source["id"], uri)
             if target is not None and target["id"] == source["id"]:
                 index["uri"] = to_uri + uri[len(from_uri) :]
-                await self._store.write_json(
-                    self._path(account_id, source["id"], index["uri"]), index
-                )
+                await self._store.put_version_index(account_id, source["id"], index)
 
     async def drop_all(self, account_id: str, target_id: str) -> None:
-        await self._store.remove(self._dir(account_id, target_id), recursive=True)
+        await self._store.clear_version_indexes(account_id, target_id)
 
     # ---------- fs/rm and fs/mv ----------
 
@@ -1490,8 +1866,8 @@ class CompileVersions:
             if record is not None:
                 for index in await self._indexes(ctx.account_id, record["id"]):
                     if index["uri"] == uri or index["uri"].startswith(f"{uri}/"):
-                        await self._store.remove(
-                            self._path(ctx.account_id, record["id"], index["uri"])
+                        await self._store.delete_version_index(
+                            ctx.account_id, record["id"], index["uri"]
                         )
                 if is_versioned(uri):
                     await self._store.mark_content_updated(ctx.account_id, record["id"])
@@ -1521,11 +1897,9 @@ class CompileVersions:
                 record["to"] = to_uri + record["to"][len(from_uri) :]
                 record["content_updated_at"] = time.time()
             for index in await self._indexes(ctx.account_id, item["id"]):
-                await self._store.remove(self._path(ctx.account_id, item["id"], index["uri"]))
+                await self._store.delete_version_index(ctx.account_id, item["id"], index["uri"])
                 index["uri"] = record["to"] + index["uri"][len(item["to"]) :]
-                await self._store.write_json(
-                    self._path(ctx.account_id, item["id"], index["uri"]), index
-                )
+                await self._store.put_version_index(ctx.account_id, item["id"], index)
         if not moved:
             await self.move(ctx.account_id, from_uri, to_uri)
             for uri in {from_uri, to_uri}:
@@ -1572,8 +1946,7 @@ class CompileVersions:
         """
         await self._fs._ensure_access(uri, ctx, action=AclAction.WRITE)
         record = await self._managed(uri, ctx)
-        path = self._path(ctx.account_id, record["id"], uri)
-        index = await self._read_index(path) or {"versions": []}
+        index = await self.load(ctx.account_id, record["id"], uri) or {"versions": []}
         source = next((v for v in index["versions"] if v["version_id"] == restore_version), None)
         if source is None:
             raise NotFoundError(restore_version, "file version")
@@ -1582,11 +1955,11 @@ class CompileVersions:
 
         async def commit_restore(uris, *, lease_ref, write):
             """Check, write and version under the content lease before refresh."""
-            async with self._store.locked(path):
+            async with self._store.lock_version_index(ctx.account_id, target_id, uri):
                 record = await self._store.get(ctx.account_id, target_id)
                 if await self._running(ctx.account_id, record):
                     raise ConflictError("Compile is running", resource="COMPILE_RUNNING")
-                index = await self._read_index(path) or {"versions": []}
+                index = await self.load(ctx.account_id, target_id, uri) or {"versions": []}
                 current = index["versions"][-1]["version_id"] if index["versions"] else None
                 if current != current_version:
                     raise ConflictError(

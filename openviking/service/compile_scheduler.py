@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from openviking.server.identity import RequestContext, Role
-from openviking.service.compile_targets import CompileStateStore, task_ctx
+from openviking.service.compile_targets import CompileStore, task_ctx
 from openviking_cli.exceptions import ConflictError, FailedPreconditionError, NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
@@ -110,7 +110,7 @@ class CompileScheduler:
     def __init__(
         self,
         compile_service: Any,
-        store: CompileStateStore,
+        store: CompileStore,
         viking_fs: Any,
         *,
         backend: str = "local",
@@ -198,8 +198,10 @@ class CompileScheduler:
                 except Exception:
                     logger.exception("Compile schedule check failed for %s", item.get("id"))
 
-    async def reschedule(self, account_id: str, record: Dict[str, Any]) -> None:
-        """Mirror a record's schedule into Redis; local backend needs nothing."""
+    async def reschedule(
+        self, account_id: str, record: Dict[str, Any], *, raise_on_error: bool = False
+    ) -> None:
+        """Mirror a schedule; raise_on_error lets expiry callbacks retry Redis failures."""
         if self._expiry is None:
             return
         from openviking.scheduling.expiry import ExpiryMode, ExpiryRegistration, ItemIdentity
@@ -226,6 +228,8 @@ class CompileScheduler:
         except Exception:
             # The compensation scan repairs a missing or stale registration.
             logger.warning("Compile reschedule failed for %s", record["id"], exc_info=True)
+            if raise_on_error:
+                raise
 
     # ---------- decision and submission ----------
 
@@ -237,6 +241,7 @@ class CompileScheduler:
         async with self._store.edit(account_id, target_id) as record:
             slot = current_slot(record["update_schedule"], now)
             if not is_due(record, slot):
+                await self.reschedule(account_id, record, raise_on_error=True)
                 return "not_due"
             slot_iso = slot.isoformat()
             key = f"compile-schedule:{target_id}:{slot_iso}"
@@ -263,7 +268,7 @@ class CompileScheduler:
                 except ConflictError:
                     pass  # Same slot already submitted with older parameters.
             record["last_triggered_slot"] = slot_iso
-        await self.reschedule(account_id, record)
+        await self.reschedule(account_id, record, raise_on_error=True)
         return outcome
 
     async def _executor(self, record: Dict[str, Any]) -> tuple[RequestContext, Dict[str, Any]]:

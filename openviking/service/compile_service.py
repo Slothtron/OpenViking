@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -679,6 +680,34 @@ class CompileService:
         ]
         next_cursor = page[-1]["operation_id"] if len(operations) > limit else None
         return {"operations": public, "next_cursor": next_cursor}
+
+    async def operation_outputs(
+        self,
+        to: str,
+        operation_id: str,
+        ctx: RequestContext,
+        *,
+        limit: int,
+        cursor: str | None,
+    ) -> dict[str, Any]:
+        """Read one authorized operation's immutable-path version references, ordered by URI."""
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}", operation_id):
+            raise InvalidArgumentError("Invalid operation_id")
+        record = await self._target(to, ctx)
+        store = self._require_lifecycle().store
+        if await store.get_operation(ctx.account_id, record["id"], operation_id) is None:
+            raise NotFoundError(operation_id, "operation")
+        manifest = await store.get_outputs(ctx.account_id, record["id"], operation_id)
+        if manifest is None:
+            raise NotFoundError(operation_id, "operation outputs not recorded")
+        outputs = sorted(manifest["outputs"], key=lambda item: item["uri"])
+        if cursor:
+            outputs = [item for item in outputs if item["uri"] > cursor]
+        page = outputs[:limit]
+        result = {"outputs": page, "next_cursor": page[-1]["uri"] if len(outputs) > limit else None}
+        if manifest.get("versions_available") is False:
+            result["versions_available"] = False
+        return result
 
     async def file_versions(
         self, uri: str, ctx: RequestContext, *, limit: int, before: str | None

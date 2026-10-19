@@ -5,6 +5,8 @@ the scheduled run acts as that asserted user. AGFS content stays unencrypted.
 """
 
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -29,6 +31,7 @@ SKILL = "viking://user/alice/skills/wiki"
 async def test_trusted_root_key_enables_and_triggers_schedule(service, tmp_path, monkeypatch):
     assert service._encryptor is None  # encryption.enabled stays false
     scheduler = service.compile_scheduler
+    await scheduler.stop()
     monkeypatch.setattr(scheduler.credential_encryptor.provider, "key_file", tmp_path / "k")
     service.compile.configure_local_backend("http://127.0.0.1:1", "")
 
@@ -85,7 +88,15 @@ async def test_trusted_root_key_enables_and_triggers_schedule(service, tmp_path,
     before = datetime(2026, 10, 13, 8, 29, tzinfo=TZ)
     assert await scheduler.trigger_if_due("acct", record["id"], before) == "not_due"
     now = datetime(2026, 10, 13, 8, 30, tzinfo=TZ)
-    assert await scheduler.trigger_if_due("acct", record["id"], now) == "submitted"
+    report = AsyncMock(side_effect=[ConnectionError("redis unavailable")] * 2 + [None])
+    monkeypatch.setattr(scheduler, "_expiry", SimpleNamespace(report=report))
+    for _ in range(2):
+        with pytest.raises(ConnectionError):
+            await scheduler.trigger_if_due("acct", record["id"], now)
+    assert await scheduler.trigger_if_due("acct", record["id"], now) == "not_due"
+    assert len(submitted) == 1 and report.await_count == 3
+    report.side_effect = ConnectionError("redis unavailable")
+    await scheduler.reschedule("acct", record)
     assert submitted[0] == {"api_key": ROOT, "account_id": "acct", "user_id": "alice"}
     record = await store.get("acct", record["id"])
     assert record["last_triggered_slot"] == "2026-10-13T08:30:00+08:00"

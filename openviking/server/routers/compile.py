@@ -81,6 +81,25 @@ async def list_compile_operations(
     return Response(status="ok", result=result)
 
 
+@router.get("/compile/operations/{operation_id}/outputs")
+async def operation_outputs(
+    operation_id: str = Path(
+        ..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9:._-]*$"
+    ),
+    to: str = Query(..., min_length=1),
+    limit: int = Query(20, ge=1, le=100),
+    cursor: str | None = Query(None),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    """List one operation's output files and frozen version references."""
+    return Response(
+        status="ok",
+        result=await get_service().compile.operation_outputs(
+            to, operation_id, ctx, limit=limit, cursor=cursor
+        ),
+    )
+
+
 @router.get("/compile/capabilities")
 async def compile_capabilities(ctx: RequestContext = Depends(get_request_context)):
     return Response(status="ok", result=get_service().compile.capabilities(ctx))

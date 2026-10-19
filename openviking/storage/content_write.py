@@ -9,6 +9,7 @@ import base64
 import binascii
 import hashlib
 import os
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -211,11 +212,13 @@ class ContentWriteCoordinator:
         vikingdb: Any = None,
         privacy_sanitizer: PrivacySanitizer | None = None,
         commit_content: Callable[..., Awaitable[Any]] | None = None,
+        commit_batch: Callable[..., Awaitable[None]] | None = None,
     ):
         self._viking_fs = viking_fs
         self._vikingdb = vikingdb
         self._privacy_sanitizer = privacy_sanitizer
         self._content_commit = commit_content
+        self._batch_commit = commit_batch
 
     async def _commit_content(self, uris: list[str], lease: Any, write) -> Any:
         """Write bytes and managed versions under the lease before refresh."""
@@ -547,61 +550,71 @@ class ContentWriteCoordinator:
                     ],
                     ctx=ctx,
                 )
-            for operation, existed, write_mode in pending:
-                uri = operation["uri"]
-                try:
-                    prepared = prepared_resources.get(uri)
-                    if prepared is not None:
-                        write_content = partial(
-                            execute_content_tree_actions,
-                            prepared.plan.content_tree_actions,
-                            store=prepared.store,
-                            artifact_ref=prepared.artifact_ref,
-                            target=prepared.target,
-                        )
+            try:
+                for operation, existed, write_mode in pending:
+                    uri = operation["uri"]
+                    try:
+                        prepared = prepared_resources.get(uri)
+                        if prepared is not None:
+                            write_content = partial(
+                                execute_content_tree_actions,
+                                prepared.plan.content_tree_actions,
+                                store=prepared.store,
+                                artifact_ref=prepared.artifact_ref,
+                                target=prepared.target,
+                            )
+                        else:
+                            write_content = partial(
+                                self._write_in_place,
+                                uri,
+                                operation["content"],
+                                mode=write_mode,
+                                ctx=ctx,
+                                lease_ref=lease,
+                                is_new_file=not existed,
+                            )
+                        final_content = await self._commit_content([uri], lease, write_content)
+                        if prepared is not None:
+                            final_content = prepared.final_bytes
+                            committed_resource_plans.append(prepared)
+                        if context_type_for_uri(uri) in {
+                            "resource",
+                            "skill",
+                        } and not is_abstract_overview_uri(uri):
+                            file_md5s[uri] = content_md5(final_content)
+                        options = operation["ingest_options"]
+                        if options.acl_update:
+                            await self._viking_fs.acl_manager.apply_indexed_update(
+                                options.acl_update, ctx
+                            )
+                    except Exception as exc:
+                        write_error = exc
+                        break
+                    if existed:
+                        updated.append(uri)
+                        if is_abstract_overview_uri(uri):
+                            parent = VikingURI(uri).parent
+                            if parent is not None:
+                                # Sidecars represent directory L0/L1 records. If
+                                # multiple sidecar writes share a directory, the
+                                # deterministic operation order matches sequential
+                                # write semantics: the last operation's options win.
+                                sidecar_directories[parent.uri] = options
+                        elif prepared is None:
+                            refresh_kinds[uri] = "modified"
                     else:
-                        write_content = partial(
-                            self._write_in_place,
-                            uri,
-                            operation["content"],
-                            mode=write_mode,
-                            ctx=ctx,
-                            lease_ref=lease,
-                            is_new_file=not existed,
-                        )
-                    final_content = await self._commit_content([uri], lease, write_content)
-                    if prepared is not None:
-                        final_content = prepared.final_bytes
-                        committed_resource_plans.append(prepared)
-                    if context_type_for_uri(uri) in {
-                        "resource",
-                        "skill",
-                    } and not is_abstract_overview_uri(uri):
-                        file_md5s[uri] = content_md5(final_content)
-                    options = operation["ingest_options"]
-                    if options.acl_update:
-                        await self._viking_fs.acl_manager.apply_indexed_update(
-                            options.acl_update, ctx
-                        )
-                except Exception as exc:
-                    write_error = exc
-                    break
-                if existed:
-                    updated.append(uri)
-                    if is_abstract_overview_uri(uri):
-                        parent = VikingURI(uri).parent
-                        if parent is not None:
-                            # Sidecars represent directory L0/L1 records. If
-                            # multiple sidecar writes share a directory, the
-                            # deterministic operation order matches sequential
-                            # write semantics: the last operation's options win.
-                            sidecar_directories[parent.uri] = options
-                    elif prepared is None:
-                        refresh_kinds[uri] = "modified"
-                else:
-                    created.append(uri)
-                    if prepared is None:
-                        refresh_kinds[uri] = "added"
+                        created.append(uri)
+                        if prepared is None:
+                            refresh_kinds[uri] = "added"
+            finally:
+                if self._batch_commit is not None:
+                    error = sys.exc_info()[1]
+                    try:
+                        await run_to_completion(lambda: self._batch_commit(lease_ref=lease))
+                    except BaseException:
+                        if error is None and write_error is None:
+                            raise
+                        logger.exception("Failed to version partial batch writes")
         except BaseException:
             await self._viking_fs._async_agfs.pathlock_release(lease)
             raise
