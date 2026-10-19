@@ -3,7 +3,7 @@
 
 use regex::Regex;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Deserialize)]
 struct Config {
@@ -29,6 +29,8 @@ pub struct PrivacyExtractor {
     scheme: Regex,
     bracket: Regex,
     reference: Regex,
+    bold: Regex,
+    code_delimiter: Regex,
     unicode_alphanumeric: Regex,
 }
 
@@ -53,6 +55,9 @@ impl PrivacyExtractor {
             scheme: Regex::new(&cfg.scheme_pattern).map_err(|error| error.to_string())?,
             bracket: Regex::new(&cfg.bracket_pattern).map_err(|error| error.to_string())?,
             reference: Regex::new(&cfg.reference_pattern).map_err(|error| error.to_string())?,
+            bold: Regex::new(r"(?:^|[\s(>=:])\*\*(?P<text>[^\s*](?:[^\r\n]*?[^\s*])?)\*\*")
+                .map_err(|error| error.to_string())?,
+            code_delimiter: Regex::new(r"`+|~{3,}").map_err(|error| error.to_string())?,
             unicode_alphanumeric: Regex::new(r"^[\p{L}\p{N}]$")
                 .map_err(|error| error.to_string())?,
             cfg,
@@ -169,6 +174,68 @@ impl PrivacyExtractor {
         }
         hits.push(Hit { start, end, field });
         Ok(())
+    }
+
+    fn mask_markdown_markers(&self, s: &str) -> Option<String> {
+        let delimiters: Vec<_> = self.code_delimiter.find_iter(s).collect();
+        // Index equal-length runs once so unmatched inline delimiters stay linear-time.
+        let mut next = vec![None; delimiters.len()];
+        let mut following = HashMap::new();
+        for (i, delimiter) in delimiters.iter().enumerate().rev() {
+            let key = (delimiter.as_str().as_bytes()[0], delimiter.len());
+            next[i] = following.insert(key, i);
+        }
+        let mut masked = None;
+        let mut cursor = 0;
+        let mut i = 0;
+        while i < delimiters.len() {
+            let open = delimiters[i];
+            let marker = open.as_str().as_bytes()[0];
+            let fenced = open.len() >= 3
+                && fence_line_start(s, open.start())
+                && (marker != b'`' || !s[open.end()..].split('\n').next().unwrap().contains('`'));
+            let close = if fenced {
+                (i + 1..delimiters.len()).find(|&j| {
+                    let m = delimiters[j];
+                    m.as_str().as_bytes()[0] == marker
+                        && m.len() >= open.len()
+                        && fence_line_start(s, m.start())
+                        && s[m.end()..].split('\n').next().unwrap().trim().is_empty()
+                })
+            } else if marker == b'`' {
+                next[i]
+            } else {
+                None
+            };
+            if close.is_none() && !fenced {
+                i += 1;
+                continue;
+            }
+            self.mask_bold_markers(s, cursor, open.start(), &mut masked);
+            let bytes = masked.get_or_insert_with(|| s.as_bytes().to_vec());
+            bytes[open.start()..open.end()].fill(b' ');
+            cursor = if let Some(j) = close {
+                let end = delimiters[j];
+                bytes[end.start()..end.end()].fill(b' ');
+                i = j + 1;
+                end.end()
+            } else {
+                i = delimiters.len();
+                s.len()
+            };
+        }
+        self.mask_bold_markers(s, cursor, s.len(), &mut masked);
+        masked.map(|bytes| String::from_utf8(bytes).expect("ASCII replacement preserves UTF-8"))
+    }
+
+    fn mask_bold_markers(&self, s: &str, start: usize, end: usize, masked: &mut Option<Vec<u8>>) {
+        // Emphasis inside code is literal; only scan the gaps between code regions.
+        for cap in self.bold.captures_iter(&s[start..end]) {
+            let text = cap.name("text").unwrap();
+            let bytes = masked.get_or_insert_with(|| s.as_bytes().to_vec());
+            bytes[start + text.start() - 2..start + text.start()].fill(b' ');
+            bytes[start + text.end()..start + text.end() + 2].fill(b' ');
+        }
     }
 
     fn value_span(&self, s: &str, mut start: usize) -> (usize, usize) {
@@ -296,6 +363,10 @@ impl PrivacyExtractor {
             self.add(&mut hits, s, start, s.len(), field, true)?;
             return Ok(to_char_offsets(s, hits));
         }
+        // Replace Markdown delimiters with whitespace, retaining original offsets and values.
+        let source = s;
+        let scan_text = self.mask_markdown_markers(s);
+        let s = scan_text.as_deref().unwrap_or(s);
         if s.contains(['=', ':', '：']) {
             let mut cursor = 0;
             let mut covered = 0;
@@ -323,7 +394,7 @@ impl PrivacyExtractor {
                     continue;
                 }
                 let (start, end) = self.value_span(s, start);
-                self.add(&mut hits, s, start, end, key, false)?;
+                self.add(&mut hits, source, start, end, key, false)?;
                 covered = end;
             }
         }
@@ -382,7 +453,7 @@ impl PrivacyExtractor {
                     }
                     self.add(
                         &mut hits,
-                        s,
+                        source,
                         start,
                         end,
                         if combined { "credential" } else { key },
@@ -407,7 +478,7 @@ impl PrivacyExtractor {
                 {
                     continue;
                 }
-                self.add(&mut hits, s, m.start(), m.end(), "credential", false)?;
+                self.add(&mut hits, source, m.start(), m.end(), "credential", false)?;
             }
         }
         if s.contains(['b', 'B']) {
@@ -425,7 +496,7 @@ impl PrivacyExtractor {
                 let value = cap.name("value").unwrap();
                 self.add(
                     &mut hits,
-                    s,
+                    source,
                     value.start(),
                     value.end(),
                     "authorization",
@@ -456,8 +527,20 @@ impl PrivacyExtractor {
             }
             merged.push(h);
         }
-        Ok(to_char_offsets(s, merged))
+        Ok(to_char_offsets(source, merged))
     }
+}
+
+fn fence_line_start(s: &str, pos: usize) -> bool {
+    let mut prefix = s[..pos].bytes().rev();
+    for _ in 0..3 {
+        match prefix.next() {
+            None | Some(b'\n') => return true,
+            Some(b' ') => (),
+            _ => return false,
+        }
+    }
+    matches!(prefix.next(), None | Some(b'\n'))
 }
 
 fn normalize_key(s: &str) -> String {
@@ -537,6 +620,68 @@ mod tests {
                 .unwrap(),
             vec![(0, 10, "password".to_owned())]
         );
+    }
+
+    #[test]
+    fn markdown_delimiters_preserve_value_boundaries_and_literal_symbols() {
+        let extractor = PrivacyExtractor::new().unwrap();
+        for (text, expected) in [
+            ("**API_KEY=secret-value**", "secret-value"),
+            ("1. **API_KEY=secret-value**.", "secret-value"),
+            ("password=**secret-value**", "secret-value"),
+            ("**Authorization: Bearer secret-value**", "secret-value"),
+            ("**sk-abcdefghijklmnopqrstuv**", "sk-abcdefghijklmnopqrstuv"),
+            ("password=secret**", "secret**"),
+            ("password=ab**cd", "ab**cd"),
+            ("password=***", "***"),
+            ("**password='secret**'**", "secret**"),
+            ("password='**secret**'", "**secret**"),
+            ("`API_KEY=secret-value`", "secret-value"),
+            ("password=`secret-value`", "secret-value"),
+            ("``API_KEY=secret-value``", "secret-value"),
+            ("**`API_KEY=secret-value`**", "secret-value"),
+            ("**API_KEY=`secret-value`**", "secret-value"),
+            ("`password=**secret**`", "**secret**"),
+            ("``password=has`tick``", "has`tick"),
+            ("````password=has```ticks````", "has```ticks"),
+            ("`Authorization: Bearer secret-value`", "secret-value"),
+            ("`--api-key secret-value`", "secret-value"),
+            ("``--password='secret`**'``", "secret`**"),
+            ("password='literal`tick`**'", "literal`tick`**"),
+            ("password=unpaired`", "unpaired`"),
+            ("`unclosed password=secret-value", "secret-value"),
+            ("`password='**secret**'`", "**secret**"),
+            ("```\npassword=**secret**\n```", "**secret**"),
+            ("```sh\npassword=**secret**\n````", "**secret**"),
+            ("~~~sh\npassword=**secret**\n~~~~", "**secret**"),
+            ("```sh\npassword=**secret**", "**secret**"),
+            ("~~~sh\npassword=**secret**", "**secret**"),
+            ("**heading** password=secret**", "secret**"),
+            ("中文 **password=密码**", "密码"),
+            ("中文 `password=密码`。", "密码"),
+        ] {
+            let chars: Vec<_> = text.chars().collect();
+            let values: Vec<String> = extractor
+                .extract(text, None)
+                .unwrap()
+                .iter()
+                .map(|(s, e, _)| chars[*s..*e].iter().collect())
+                .collect();
+            assert_eq!(values, [expected], "{text}");
+        }
+        assert_eq!(
+            extractor.extract("**secret**", Some("password")).unwrap(),
+            vec![(0, 10, "password".to_owned())]
+        );
+        let text = "`password=one` **password=two** ``password=three`tick`` password='four`**'";
+        let chars: Vec<_> = text.chars().collect();
+        let values: Vec<String> = extractor
+            .extract(text, None)
+            .unwrap()
+            .iter()
+            .map(|(s, e, _)| chars[*s..*e].iter().collect())
+            .collect();
+        assert_eq!(values, ["one", "two", "three`tick", "four`**"]);
     }
 
     #[test]

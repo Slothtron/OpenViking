@@ -104,6 +104,37 @@ async def test_new_equal_fields_keep_independent_references_when_one_rotates(ser
     }
 
 
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        "**{}**",
+        "`{}`",
+        "``{}``",
+        "**`{}`**",
+        "`**heading**` `{}`",
+        "```text\n{}\n```",
+        "~~~text\n{}\n~~~",
+    ],
+)
+async def test_markdown_restatement_reuses_references_without_new_versions(service, ctx, wrapper):
+    session = await service.sessions.create(ctx, "markdown-restatement")
+    user_text = "API_KEY=demo-api-secret\nAuthorization: Bearer demo-bearer-secret\nsk-abcdefghijklmnopqrstuv"
+    await session.add_message_async("user", [TextPart(user_text)])
+    initial = await service.privacy_configs.get_current(ctx, "session", session.session_id)
+    reference = session.messages[0].parts[0].text.splitlines()[0].split("=", 1)[1]
+    assistant_text = "\n".join(wrapper.format(line) for line in user_text.splitlines())
+    await session.add_message_async("assistant", [TextPart(assistant_text)])
+    assert wrapper.format(f"API_KEY={reference}") in session.messages[1].parts[0].text
+    current = await service.privacy_configs.get_current(ctx, "session", session.session_id)
+    assert current.values == initial.values
+    assert await service.privacy_configs.list_versions(ctx, "session", session.session_id) == [1]
+    restored = await service.fs.read(session.uri + "/messages.jsonl", ctx=ctx)
+    assert [json.loads(line)["parts"][0]["text"] for line in restored.splitlines()] == [
+        user_text,
+        assistant_text,
+    ]
+
+
 @pytest.mark.parametrize("entrypoint", ["session", "skill"])
 async def test_session_and_skill_require_explicit_reference_for_ambiguous_value(
     service, ctx, entrypoint
