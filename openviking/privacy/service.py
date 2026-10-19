@@ -251,10 +251,10 @@ class UserPrivacyConfigService:
         async with self._config_lock(
             ctx, category, target_key, owner_lease_ref=owner_lease_ref
         ) as lease:
+            current = await self.get_current(ctx, category, target_key)
             if preserve_fields:
                 # Resolve retained references under the write lock so a Skill
                 # prepared before a credential rotation keeps the latest value.
-                current = await self.get_current(ctx, category, target_key)
                 retained = (
                     {key: value for key, value in current.values.items() if key in preserve_fields}
                     if current is not None
@@ -270,6 +270,7 @@ class UserPrivacyConfigService:
                 change_reason=change_reason,
                 labels=labels,
                 lease_ref=lease,
+                current=current,
             )
 
     async def patch_values(
@@ -282,7 +283,7 @@ class UserPrivacyConfigService:
         change_reason: str = "",
         labels: Optional[dict[str, Any]] = None,
     ) -> UserPrivacyConfigVersion:
-        """Atomically merge fields into current values, creating the target if absent."""
+        """Atomically update named fields, preserving independent fields with equal values."""
         async with self._config_lock(ctx, category, target_key) as lease:
             current = await self.get_current(ctx, category, target_key)
             values = dict(current.values) if current is not None else {}
@@ -296,6 +297,7 @@ class UserPrivacyConfigService:
                 change_reason=change_reason,
                 labels=labels,
                 lease_ref=lease,
+                current=current,
             )
 
     async def _upsert_locked(
@@ -309,14 +311,14 @@ class UserPrivacyConfigService:
         change_reason: str,
         labels: Optional[dict[str, Any]],
         lease_ref: Optional[dict[str, Any]],
+        current: Optional[UserPrivacyConfigVersion],
     ) -> UserPrivacyConfigVersion:
         """Persist a complete snapshot while the caller holds the target lock."""
-        validate_privacy_values(values)
+        validate_privacy_values(values, category=category)
         validate_privacy_metadata(change_reason=change_reason, labels=labels)
         await self._ensure_root(ctx, category, target_key, lease_ref)
         now = get_current_timestamp()
         meta = await self.get_meta(ctx, category, target_key)
-        current = await self.get_current(ctx, category, target_key)
 
         if current and canonicalize_values(current.values) == canonicalize_values(values):
             if meta is None:
