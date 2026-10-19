@@ -700,8 +700,6 @@ class CompileLifecycle:
                 payload, control, runtime_args, instruction_set, ctx
             )
             target_id, trigger = record["id"], "manual"
-            if record["instruction"]:
-                task_payload["instruction"] = record["instruction"]
             runtime_args = {**record["execution_context"]["args"], **runtime_args}
         if runtime_args:
             task_payload["args"] = runtime_args
@@ -732,7 +730,7 @@ class CompileLifecycle:
                     resource="COMPILE_SKILL_MISMATCH",
                 )
             self.apply_sources(record, sources, payload["skill"])
-            if instruction_set:
+            if instruction_set and ("auto_update" in control or "update_schedule" in control):
                 record["instruction"] = payload.get("instruction") or None
             persisted = {k: v for k, v in runtime_args.items() if k != "last_compile_time"}
             if persisted:

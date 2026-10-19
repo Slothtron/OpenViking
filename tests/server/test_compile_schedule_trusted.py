@@ -52,6 +52,7 @@ async def test_trusted_root_key_enables_and_triggers_schedule(service, tmp_path,
         "from": [SRC],
         "to": TO,
         "skill": SKILL,
+        "instruction": "scheduled instruction",
         "args": {
             "auto_update": True,
             "update_schedule": {"frequency": "weekly", "weekday": 2, "hour": 8, "minute": 30},
@@ -61,12 +62,21 @@ async def test_trusted_root_key_enables_and_triggers_schedule(service, tmp_path,
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         created = await client.post("/api/v1/compile", json=body, headers=headers)
+        manual_body = {key: body[key] for key in ("from", "to", "skill")}
+        for extra in ({"instruction": "once"}, {}):
+            manual = await client.post(
+                "/api/v1/compile", json={**manual_body, **extra}, headers=headers
+            )
+            assert manual.status_code == 202, manual.text
+            payload = manual.json()["result"]["meta"]["request"]
+            assert payload.get("instruction") == extra.get("instruction")
     assert created.status_code == 202, created.text
     await manager.close()
 
     store = service.compile.lifecycle.store
     record = await store.get_by_to("acct", TO)
     assert record["auto_update"] is True
+    assert record["instruction"] == "scheduled instruction"
     assert record["execution_context"]["executor"] == {
         "account_id": "acct",
         "user_id": "alice",
@@ -78,6 +88,7 @@ async def test_trusted_root_key_enables_and_triggers_schedule(service, tmp_path,
 
     async def capture(record, *, ctx, connection, idempotency_key):
         submitted.append(connection)
+        assert record["instruction"] == "scheduled instruction"
 
     monkeypatch.setattr(service.compile, "create_scheduled", capture)
     async with store.edit("acct", record["id"]) as record:

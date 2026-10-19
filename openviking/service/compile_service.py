@@ -66,8 +66,8 @@ class CompileRequest(BaseModel):
     skill: str = Field(min_length=1)
     instruction: str | None = None
     args: dict[str, Any] | None = None
-    # Whether the caller sent ``instruction`` (or legacy ``reason``); an omitted
-    # value reuses the registered instruction, an explicit empty one clears it.
+    # Explicit instruction/reason updates the saved instruction only when the
+    # request also configures scheduling; ordinary manual instructions are per-run.
     _instruction_sent: bool = PrivateAttr(default=False)
 
     @property
