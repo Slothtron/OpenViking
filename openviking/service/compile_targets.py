@@ -84,6 +84,7 @@ SUMMARY_FIELDS = (
     "id",
     "to",
     "status",
+    "deleted_at",
     "initialized",
     "auto_update",
     "update_schedule",
@@ -103,7 +104,7 @@ def new_record(target_id: str, to: str) -> Dict[str, Any]:
         "compile_type": "compile",  # Compile category for this target.
         "conflicts_num": 0,  # Number of conflicting files under this target.
         "status": "active",
-        "deleted_at": None,
+        "deleted_at": None,  # Last deletion time; retained on reactivation to reject old tasks.
         "from": [],
         "skill": None,
         "instruction": None,
@@ -141,11 +142,17 @@ class CompileStore(Protocol):
     """
 
     async def register(self, account_id: str, to: str) -> str: ...
-    async def find_id(self, account_id: str, to: str) -> Optional[str]: ...
+    async def find_id(
+        self, account_id: str, to: str, *, include_deleted: bool = False
+    ) -> Optional[str]: ...
     async def get(self, account_id: str, target_id: str) -> Optional[Dict[str, Any]]: ...
-    async def get_by_to(self, account_id: str, to: str) -> Optional[Dict[str, Any]]: ...
+    async def get_by_to(
+        self, account_id: str, to: str, *, include_deleted: bool = False
+    ) -> Optional[Dict[str, Any]]: ...
     def edit(self, account_id: str, target_id: str) -> AsyncContextManager[Dict[str, Any]]: ...
-    async def list_summaries(self, account_id: str) -> List[Dict[str, Any]]: ...
+    async def list_summaries(
+        self, account_id: str, inherited_lease: Any = None
+    ) -> List[Dict[str, Any]]: ...
     async def list_accounts(self) -> List[str]: ...
     async def mark_content_updated(self, account_id: str, target_id: str) -> None: ...
 
@@ -186,7 +193,7 @@ class CompileStore(Protocol):
         self, account_id: str, target_id: str, index: Dict[str, Any], lock_token: Any = None
     ) -> None: ...
     async def delete_version_index(self, account_id: str, target_id: str, uri: str) -> None: ...
-    async def clear_version_indexes(self, account_id: str, target_id: str) -> None: ...
+    async def clear_output_data(self, account_id: str, target_id: str) -> None: ...
     def lock_version_index(
         self, account_id: str, target_id: str, uri: str, inherited_lock: Any = None
     ) -> AsyncContextManager[Any]: ...
@@ -255,25 +262,30 @@ class CompileStateStore:
 
     # ---------- target_folders.json ----------
 
-    async def list_summaries(self, account_id: str) -> List[Dict[str, Any]]:
-        data = await self.read_json(self._targets_path(account_id))
-        return list((data or {}).get("targets", []))
+    async def list_summaries(
+        self, account_id: str, inherited_lease: Any = None
+    ) -> List[Dict[str, Any]]:
+        path = self._targets_path(account_id)
+        async with self.locked(path, inherited_lease):
+            data = await self.read_json(path)
+            return list((data or {}).get("targets", []))
 
     async def _sync_summary(self, account_id: str, record: Dict[str, Any]) -> None:
         """Update only this target's entry so concurrent writers never clobber each other."""
         path = self._targets_path(account_id)
         async with self.locked(path) as lease:
+            data = await self.read_json(path)
             targets = [
-                item
-                for item in await self.list_summaries(account_id)
-                if item.get("id") != record["id"]
+                item for item in (data or {}).get("targets", []) if item.get("id") != record["id"]
             ]
             targets.append(summarize(record))
             await self.write_json(path, {"targets": targets}, lease)
 
-    async def find_id(self, account_id: str, to: str) -> Optional[str]:
+    async def find_id(
+        self, account_id: str, to: str, *, include_deleted: bool = False
+    ) -> Optional[str]:
         for item in await self.list_summaries(account_id):
-            if item.get("to") == to and item.get("status") == "active":
+            if item.get("to") == to and (include_deleted or item.get("status") == "active"):
                 return item.get("id")
         return None
 
@@ -282,8 +294,10 @@ class CompileStateStore:
     async def get(self, account_id: str, target_id: str) -> Optional[Dict[str, Any]]:
         return await self.read_json(self._record_path(account_id, target_id))
 
-    async def get_by_to(self, account_id: str, to: str) -> Optional[Dict[str, Any]]:
-        target_id = await self.find_id(account_id, to)
+    async def get_by_to(
+        self, account_id: str, to: str, *, include_deleted: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        target_id = await self.find_id(account_id, to, include_deleted=include_deleted)
         return await self.get(account_id, target_id) if target_id else None
 
     @asynccontextmanager
@@ -299,19 +313,40 @@ class CompileStateStore:
             await self._sync_summary(account_id, record)
 
     async def register(self, account_id: str, to: str) -> str:
-        """Return the active target ID for ``to``, creating a record on first use."""
+        """Activate the path's persistent identity, resetting deleted output state."""
         path = self._targets_path(account_id)
         async with self.locked(path) as lease:
-            existing = await self.find_id(account_id, to)
-            if existing:
-                return existing
-            target_id = f"target_{uuid4().hex[:16]}"
-            record = new_record(target_id, to)
-            await self.write_json(self._record_path(account_id, target_id), record)
-            targets = await self.list_summaries(account_id)
-            targets.append(summarize(record))
-            await self.write_json(path, {"targets": targets}, lease)
-            return target_id
+            data = await self.read_json(path)
+            targets = list((data or {}).get("targets", []))
+            existing = next((item["id"] for item in targets if item["to"] == to), None)
+            if existing is None:
+                target_id = f"target_{uuid4().hex[:16]}"
+                record = new_record(target_id, to)
+                await self.write_json(self._record_path(account_id, target_id), record)
+                targets.append(summarize(record))
+                await self.write_json(path, {"targets": targets}, lease)
+                return target_id
+        # State edits acquire the registry lock when saving, so release it first.
+        async with self.edit(account_id, existing) as record:
+            if record["status"] == "deleted":
+                defaults = new_record(existing, to)
+                for key in (
+                    "status",
+                    "initialized",
+                    "progress",
+                    "versions_head",
+                    "active_task_id",
+                    "last_run",
+                    "content_updated_at",
+                    "conflicts_num",
+                    "last_error",
+                    "auto_update",
+                    "auto_update_enabled_at",
+                    "last_triggered_slot",
+                ):
+                    record[key] = defaults[key]
+                record["execution_context"]["credential"] = None
+        return existing
 
     async def mark_content_updated(self, account_id: str, target_id: str) -> None:
         """Save the observed business-file change time and synchronize its summary."""
@@ -461,9 +496,12 @@ class CompileStateStore:
         """Remove an output's index; a missing index is already deleted."""
         await self.remove(self._version_path(account_id, target_id, uri))
 
-    async def clear_version_indexes(self, account_id: str, target_id: str) -> None:
-        """Remove a target's version indexes while preserving operations and output references."""
+    async def clear_output_data(self, account_id: str, target_id: str) -> None:
+        """Remove output manifests and version indexes, retaining operation history."""
         await self.remove(self._versions_dir(account_id, target_id), recursive=True)
+        await self.remove(
+            f"{self._target_dir(account_id, target_id)}/operation_outputs", recursive=True
+        )
 
     @asynccontextmanager
     async def lock_version_index(
@@ -656,11 +694,12 @@ class CompileLifecycle:
         task_payload = {key: value for key, value in payload.items() if key != "args"}
         if scheduled_target_id is not None:
             target_id, trigger = scheduled_target_id, "scheduled"
+            record = await self._store.get(ctx.account_id, target_id)
         else:
-            target_id, trigger = await self._save_submission(
+            record = await self._save_submission(
                 payload, control, runtime_args, instruction_set, ctx
             )
-            record = await self._store.get(ctx.account_id, target_id)
+            target_id, trigger = record["id"], "manual"
             if record["instruction"]:
                 task_payload["instruction"] = record["instruction"]
             runtime_args = {**record["execution_context"]["args"], **runtime_args}
@@ -668,6 +707,7 @@ class CompileLifecycle:
             task_payload["args"] = runtime_args
         task_payload["compile"] = {
             "target_id": target_id,
+            "deleted_at": record["deleted_at"],
             "mode": control.get("mode", "incremental"),
             "trigger": trigger,
         }
@@ -680,7 +720,8 @@ class CompileLifecycle:
         runtime_args: Dict[str, Any],
         instruction_set: bool,
         ctx: RequestContext,
-    ) -> tuple[str, str]:
+    ) -> Dict[str, Any]:
+        """Save submission settings and return their state, including the deletion boundary."""
         to, sources = payload["to"], payload["from"]
         await self.validate_layout(ctx.account_id, to, sources)
         target_id = await self._store.register(ctx.account_id, to)
@@ -705,7 +746,7 @@ class CompileLifecycle:
                 )
         if self.reschedule is not None:
             await self.reschedule(ctx.account_id, record)
-        return target_id, "manual"
+        return record
 
     async def validate_layout(self, account_id: str, to: str, sources: List[str]) -> None:
         for source in sources:
@@ -760,38 +801,54 @@ class CompileLifecycle:
         if meta is None:
             return
         async with self._store.edit(task.account_id, meta["target_id"]) as record:
-            if "initial_operation_id" in record and record["initial_operation_id"] is None:
-                record["initial_operation_id"] = task.task_id
-            # Missing fields identify legacy targets whose first creation time is unknown.
-            if "first_compile_created_at" in record:
-                first = record["first_compile_created_at"]
-                record["first_compile_created_at"] = (
-                    min(first, task.created_at) if first is not None else task.created_at
-                )
+            self._record_identity(task, record)
 
-    async def record_queued(self, task: Any) -> None:
-        """Persist the Compile operation before execution; retries reuse its task identity."""
+    @staticmethod
+    def _record_identity(task: Any, record: Dict[str, Any]) -> None:
+        """Retain the target's first task identity and earliest known creation time."""
+        if "initial_operation_id" in record and record["initial_operation_id"] is None:
+            record["initial_operation_id"] = task.task_id
+        # Missing fields identify legacy targets whose first creation time is unknown.
+        if "first_compile_created_at" in record:
+            first = record["first_compile_created_at"]
+            record["first_compile_created_at"] = (
+                min(first, task.created_at) if first is not None else task.created_at
+            )
+
+    async def record_queued(
+        self, task: Any, *, locked_record: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Save queued history and outputs under the target lock, reusing a caller-held record."""
         meta = task.meta["request"]["compile"]
+        if locked_record is None:
+            async with self._store.edit(task.account_id, meta["target_id"]) as record:
+                await self.record_queued(task, locked_record=record)
+            return
+        if not self._task_is_current(locked_record, task):
+            return
         async with self._store.lock_operation(
             task.account_id, meta["target_id"], task.task_id, "create"
         ):
             run = await self._store.get_operation(task.account_id, meta["target_id"], task.task_id)
             if run is None:
-                # Scheduled submissions hold the target lock and follow an initialized Compile.
-                if meta["trigger"] != "scheduled":
-                    await self.record_created(task)
+                self._record_identity(task, locked_record)
                 await self._store.merge_outputs(
                     task.account_id, meta["target_id"], task.task_id, []
                 )
                 await self._store.put_operation(
                     task.account_id,
                     meta["target_id"],
-                    new_compile_operation(
-                        task, await self._store.get(task.account_id, meta["target_id"])
-                    ),
+                    new_compile_operation(task, locked_record),
                 )
 
     # ---------- execution hooks ----------
+
+    @staticmethod
+    def _task_is_current(record: Dict[str, Any], task: Any) -> bool:
+        """Only submissions registered after the last deletion can use active output state."""
+        return record["status"] == "active" and (
+            task.meta["request"]["compile"]["deleted_at"] == record["deleted_at"]
+        )
 
     @asynccontextmanager
     async def _locked_output(self, to: str, ctx: RequestContext) -> AsyncIterator[Any]:
@@ -815,15 +872,19 @@ class CompileLifecycle:
         meta = task.meta["request"].get("compile")
         if meta is None:
             return "proceed"
-        await self.record_queued(task)
         account_id, target_id = task.account_id, meta["target_id"]
         async with self._store.edit(account_id, target_id) as record:
+            if not self._task_is_current(record, task):
+                return ExternalTaskSnapshot(
+                    status="cancelled", error_message="Compile target was deleted"
+                )
             owner = record["active_task_id"]
             if owner and owner != task.task_id:
                 other = await self._store.get_operation(account_id, target_id, owner)
                 if other is not None and other["status"] not in TERMINAL:
                     return "busy"
             record["active_task_id"] = task.task_id
+            await self.record_queued(task, locked_record=record)
         run = await self._store.get_operation(account_id, target_id, task.task_id)
         if run is None or run["status"] == "queued":
             try:
@@ -927,7 +988,14 @@ class CompileLifecycle:
             run = await self._store.get_operation(account_id, target_id, task.task_id)
             if run is not None and run["finished_at"] is None:
                 ctx = task_ctx(task.account_id, task.user_id)
-                if run["started_at"] is None or run["status"] == "completed":
+                record = await self._store.get(account_id, target_id)
+                if not self._task_is_current(record, task):
+                    snapshot = ExternalTaskSnapshot(
+                        status=run["status"] if run["status"] in TERMINAL else "cancelled",
+                        result=run.get("result"),
+                        error_message="Compile target was deleted",
+                    )
+                elif run["started_at"] is None or run["status"] == "completed":
                     pass  # Unstarted and unchanged runs have no output to publish.
                 elif snapshot.status == "completed":
                     from openviking.server.dependencies import get_service
@@ -1002,14 +1070,17 @@ class CompileLifecycle:
                 run["finished_at"] = time.time()
                 (run.get("changes") or {}).pop("scopes", None)
                 await self._store.put_operation(account_id, target_id, run)
-            await self._release(account_id, target_id, task.task_id, run)
+            await self._release(account_id, target_id, task, run)
             return snapshot
 
     async def _release(
-        self, account_id: str, target_id: str, task_id: str, run: Optional[Dict[str, Any]]
+        self, account_id: str, target_id: str, task: Any, run: Optional[Dict[str, Any]]
     ) -> None:
         first_success = False
         async with self._store.edit(account_id, target_id) as record:
+            if not self._task_is_current(record, task):
+                return
+            task_id = task.task_id
             if (
                 record["active_task_id"] == task_id
                 or (
@@ -1313,9 +1384,11 @@ class CompileVersions:
 
     # ---------- target resolution ----------
 
-    async def owning_target(self, account_id: str, uri: str) -> Optional[Dict[str, Any]]:
+    async def owning_target(
+        self, account_id: str, uri: str, *, metadata_lease: Any = None
+    ) -> Optional[Dict[str, Any]]:
         """Return the active target containing ``uri``, including its first run."""
-        for item in await self._store.list_summaries(account_id):
+        for item in await self._store.list_summaries(account_id, metadata_lease):
             to = item.get("to") or ""
             if item.get("status") == "active" and (uri == to or uri.startswith(f"{to}/")):
                 record = await self._store.get(account_id, item["id"])
@@ -1374,7 +1447,13 @@ class CompileVersions:
         outcome = {}
         try:
             for target, entry in entries:
-                await self._store.merge_outputs(ctx.account_id, target["id"], operation_id, [])
+                async with self._store.edit(ctx.account_id, target["id"]) as record:
+                    if record["status"] == "active" and record["deleted_at"] == target.get(
+                        "deleted_at"
+                    ):
+                        await self._store.merge_outputs(
+                            ctx.account_id, target["id"], operation_id, []
+                        )
                 await self._store.put_operation(ctx.account_id, target["id"], entry)
             result = await operation()
         except BaseException as exc:
@@ -1397,12 +1476,6 @@ class CompileVersions:
 
             async def finish():
                 for target, entry in entries:
-                    await self._store.merge_outputs(
-                        ctx.account_id,
-                        target["id"],
-                        operation_id,
-                        list(context["outputs"][target["id"]].values()),
-                    )
                     entry["finished_at"] = time.time()
                     entry["result"] = {
                         key: outcome[key]
@@ -1424,12 +1497,27 @@ class CompileVersions:
                                 for path in outcome.get(key, [])
                                 if (self._fs._tree_path_to_uri(path).startswith(f"{target['to']}/"))
                             ]
-                        if any(
-                            is_versioned(path)
-                            for key in ("written_paths", "deleted_paths")
-                            for path in entry["result"][key]
+                    async with self._store.edit(ctx.account_id, target["id"]) as record:
+                        current = record["status"] == "active" and record[
+                            "deleted_at"
+                        ] == target.get("deleted_at")
+                        if current:
+                            await self._store.merge_outputs(
+                                ctx.account_id,
+                                target["id"],
+                                operation_id,
+                                list(context["outputs"][target["id"]].values()),
+                            )
+                        if (
+                            current
+                            and recursive
+                            and any(
+                                is_versioned(path)
+                                for key in ("written_paths", "deleted_paths")
+                                for path in entry["result"][key]
+                            )
                         ):
-                            await self._store.mark_content_updated(ctx.account_id, target["id"])
+                            record["content_updated_at"] = time.time()
                     await self._store.put_operation(ctx.account_id, target["id"], entry)
 
             try:
@@ -1772,7 +1860,7 @@ class CompileVersions:
             return
         for path in result.get("written_paths", []):
             uri = self._fs._tree_path_to_uri(path)
-            record = await self.owning_target(ctx.account_id, uri)
+            record = await self.owning_target(ctx.account_id, uri, metadata_lease=metadata_lease)
             if record is None or not is_versioned(uri):
                 continue
             await self.append(
@@ -1825,7 +1913,7 @@ class CompileVersions:
                 await self._store.put_version_index(account_id, source["id"], index)
 
     async def drop_all(self, account_id: str, target_id: str) -> None:
-        await self._store.clear_version_indexes(account_id, target_id)
+        await self._store.clear_output_data(account_id, target_id)
 
     # ---------- fs/rm and fs/mv ----------
 
@@ -1857,8 +1945,9 @@ class CompileVersions:
                 record["status"] = "deleted"
                 record["deleted_at"] = time.time()
                 record["auto_update"] = False
+                record["active_task_id"] = None
                 record["execution_context"]["credential"] = None
-            await self.drop_all(ctx.account_id, item["id"])
+                await self.drop_all(ctx.account_id, item["id"])
             if self.reschedule is not None:
                 await self.reschedule(ctx.account_id, record)
         if not removed:

@@ -70,10 +70,10 @@ def compile_write(service, request):
     return write
 
 
-async def _run(service, ctx, *, write_page=None):
+async def _run(service, ctx, *, write_page=None, to=TO):
     compile_service = service.compile
     compile_service.configure_local_backend("http://127.0.0.1:1", "")
-    request = CompileRequest.model_validate({"from": [SRC], "to": TO, "skill": SKILL})
+    request = CompileRequest.model_validate({"from": [SRC], "to": to, "skill": SKILL})
     task = await compile_service.create(request, connection={}, ctx=ctx)
     task = await get_task_tracker().get(task.task_id, ctx.account_id, ctx.user.user_id)
     started = await compile_service.on_start(task)
@@ -83,7 +83,7 @@ async def _run(service, ctx, *, write_page=None):
             task.meta["request"], ctx.account_id, task.task_id
         )
         if write_page:
-            await _write(service, f"{TO}/page.md", write_page, ctx)
+            await _write(service, f"{to}/page.md", write_page, ctx)
         await compile_service.on_finish(task, ExternalTaskSnapshot(status="completed"))
     return started, changes
 
@@ -851,7 +851,7 @@ async def test_concurrent_restores_of_different_files_in_one_target(service):
 
 
 @pytest.mark.asyncio
-async def test_moving_and_removing_target_keeps_registry_consistent(service):
+async def test_moving_and_removing_target_keeps_registry_consistent(service, client):
     ctx = RequestContext(user=UserIdentifier("default", "test_user"), role=Role.ROOT)
     for uri, text in [(f"{SRC}/a.md", "a"), (f"{SKILL}/SKILL.md", "s")]:
         await _write(service, uri, text, ctx)
@@ -874,8 +874,25 @@ async def test_moving_and_removing_target_keeps_registry_consistent(service):
     assert (await service.compile.get_config(TO, ctx))["content_updated_at"] > updated_at
     await service.fs.rm(TO, ctx, recursive=True)
     await service.fs.rm(moved, ctx, recursive=True)
-    assert await service.compile.list_configs(ctx) == []
-    assert await service.compile.lifecycle.store.list_operations(ctx.account_id, target_id)
+    assert {item["status"] for item in await service.compile.list_configs(ctx)} == {"deleted"}
+    history = await service.compile.list_operations(moved, ctx, limit=10, cursor=None)
+    old_id = history["operations"][-1]["operation_id"]
+    assert await store.list_version_indexes(ctx.account_id, target_id) == []
+    assert await store.get_outputs(ctx.account_id, target_id, old_id) is None
+    await service.viking_fs.mkdir(moved, ctx=ctx)
+    assert (await store.get(ctx.account_id, target_id))["status"] == "deleted"
+    assert await store.register(ctx.account_id, moved) == target_id
+    record = await store.get(ctx.account_id, target_id)
+    assert not record["initialized"] and record["progress"]["source_commit"] is None
+    assert not record["progress"]["processed_roots"] and record["versions_head"] is None
+    assert await service.compile.list_operations(moved, ctx, limit=10, cursor=None) == history
+    await _run(service, ctx, to=moved, write_page="rebuilt")
+    assert len(await service.compile.list_configs(ctx)) == 2
+    latest = (await store.list_operations(ctx.account_id, target_id))[0]["operation_id"]
+    outputs = await store.get_outputs(ctx.account_id, target_id, latest)
+    assert outputs["outputs"]
+    endpoint = f"/api/v1/compile/operations/{old_id}/outputs"
+    assert (await client.get(endpoint, params={"to": moved})).status_code == 404
 
 
 @pytest.mark.asyncio

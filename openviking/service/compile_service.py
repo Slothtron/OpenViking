@@ -27,6 +27,7 @@ from openviking.service.task_tracker import SENSITIVE_TASK_KEYS, TaskRecord
 from openviking_cli.exceptions import (
     InvalidArgumentError,
     NotFoundError,
+    PermissionDeniedError,
     UnauthenticatedError,
     UnavailableError,
 )
@@ -422,7 +423,7 @@ class CompileService:
 
     async def create_scheduled(
         self,
-        record: Mapping[str, Any],
+        record: dict[str, Any],
         *,
         ctx: RequestContext,
         connection: Mapping[str, Any],
@@ -445,7 +446,14 @@ class CompileService:
             submitted, ctx, instruction_set=False, scheduled_target_id=record["id"]
         )
         return await self._create_task(
-            payload, submitted, private_payload, normalized, connection, ctx, idempotency_key
+            payload,
+            submitted,
+            private_payload,
+            normalized,
+            connection,
+            ctx,
+            idempotency_key,
+            locked_record=record,
         )
 
     async def _create_task(
@@ -457,6 +465,8 @@ class CompileService:
         connection: Mapping[str, Any],
         ctx: RequestContext,
         idempotency_key: str | None,
+        *,
+        locked_record: dict[str, Any] | None = None,
     ) -> TaskRecord:
         task = await self._tasks.create(
             self.task_type,
@@ -472,7 +482,7 @@ class CompileService:
             ),
         )
         if self._lifecycle is not None:
-            await self._lifecycle.record_queued(task)
+            await self._lifecycle.record_queued(task, locked_record=locked_record)
         return task
 
     async def on_start(self, task: TaskRecord) -> Any:
@@ -551,11 +561,15 @@ class CompileService:
             raise UnavailableError("compile settings", "Compile target registry is not configured")
         return self._lifecycle
 
-    async def _target(self, to: str, ctx: RequestContext) -> dict[str, Any]:
+    async def _target(
+        self, to: str, ctx: RequestContext, *, include_deleted: bool = False
+    ) -> dict[str, Any]:
         lifecycle = self._require_lifecycle()
         target = validate_request_viking_uri(resolve_path_variables(to), ctx, field_name="to")
         await self._fs.ensure_write_access(target.rstrip("/"), ctx)
-        record = await lifecycle.store.get_by_to(ctx.account_id, target.rstrip("/"))
+        record = await lifecycle.store.get_by_to(
+            ctx.account_id, target.rstrip("/"), include_deleted=include_deleted
+        )
         if record is None:
             raise NotFoundError(to, "compile target")
         return record
@@ -565,6 +579,8 @@ class CompileService:
         from openviking.service.compile_scheduler import next_run_at
 
         return {
+            "target_id": record["id"],
+            "status": record["status"],
             "to": record["to"],
             "initialized": record["initialized"],
             "from": record["from"],
@@ -614,14 +630,14 @@ class CompileService:
         lifecycle = self._require_lifecycle()
         items = []
         for item in await lifecycle.store.list_summaries(ctx.account_id):
-            if item.get("status") != "active":
-                continue
             try:
-                await self._fs.stat(item["to"], ctx)
-            except Exception:
-                continue  # Unreadable or missing for this caller.
+                await lifecycle._fs._ensure_access(item["to"], ctx)
+            except PermissionDeniedError:
+                continue
             items.append(
                 {
+                    "target_id": item["id"],
+                    "status": item["status"],
                     "to": item["to"],
                     "initialized": item["initialized"],
                     "running": item["running"],
@@ -640,7 +656,7 @@ class CompileService:
         self, to: str, ctx: RequestContext, *, limit: int, cursor: str | None
     ) -> dict[str, Any]:
         """Return one target's newest operations, continuing after the operation-ID cursor."""
-        record = await self._target(to, ctx)
+        record = await self._target(to, ctx, include_deleted=True)
         operations = await self._require_lifecycle().store.list_operations(
             ctx.account_id, record["id"]
         )
