@@ -9,7 +9,7 @@ from openviking.core.namespace import canonical_user_root
 from openviking.privacy.service import UserPrivacyConfigService
 from openviking.privacy.skill_extractor import extract_skill_privacy_values
 from openviking.privacy.skill_placeholder import placeholderize_skill_content_with_blocks
-from openviking.privacy.validation import PRIVACY_MAX_FIELDS
+from openviking.privacy.validation import PRIVACY_MAX_FIELDS, SESSION_PRIVACY_MAX_FIELDS
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.viking_fs import VikingFS
 from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
@@ -67,7 +67,7 @@ class _MemoryPrivacyStorage:
 
 
 @pytest.mark.asyncio
-async def test_merge_values_preserves_snapshot_history():
+async def test_patch_values_preserves_snapshot_history():
     privacy = UserPrivacyConfigService(_MemoryPrivacyStorage())
     ctx = RequestContext(user=UserIdentifier.the_default_user("privacy_merge"), role=Role.ROOT)
     for added, expected, version in [
@@ -75,12 +75,12 @@ async def test_merge_values_preserves_snapshot_history():
         ({"one": "secret-1"}, {"one": "secret-1"}, 1),
         ({"two": "secret-2"}, {"one": "secret-1", "two": "secret-2"}, 2),
     ]:
-        result = await privacy.merge_values(ctx, "session", "demo", added)
+        result = await privacy.patch_values(ctx, "session", "demo", added)
         assert result.values == expected
         assert result.version == version
 
     await privacy.activate_version(ctx, "session", "demo", 1)
-    result = await privacy.merge_values(ctx, "session", "demo", {"three": "secret-3"})
+    result = await privacy.patch_values(ctx, "session", "demo", {"three": "secret-3"})
     assert result.version == 3
     assert result.values == {"one": "secret-1", "three": "secret-3"}
     assert await privacy.list_versions(ctx, "session", "demo") == [1, 2, 3]
@@ -173,22 +173,27 @@ async def test_privacy_config_concurrent_patches_do_not_lose_distinct_fields():
 
 
 @pytest.mark.asyncio
-async def test_privacy_config_patch_validates_final_snapshot_and_preserves_current_on_failure():
+@pytest.mark.parametrize(
+    "category,limit", [("credential", PRIVACY_MAX_FIELDS), ("session", SESSION_PRIVACY_MAX_FIELDS)]
+)
+async def test_privacy_config_patch_validates_final_snapshot_and_preserves_current_on_failure(
+    category, limit
+):
     ctx = RequestContext(user=UserIdentifier.the_default_user("privacy_limit"), role=Role.ROOT)
     privacy = UserPrivacyConfigService(_MemoryPrivacyStorage())
-    original = {f"key_{index}": index for index in range(PRIVACY_MAX_FIELDS)}
-    await privacy.upsert(ctx, "credential", "full", original, updated_by=ctx.user.user_id)
+    original = {f"key_{index}": index for index in range(limit)}
+    await privacy.upsert(ctx, category, "full", original, updated_by=ctx.user.user_id)
 
-    with pytest.raises(InvalidArgumentError, match="at most 128"):
+    with pytest.raises(InvalidArgumentError, match=f"at most {limit}"):
         await privacy.patch_values(
             ctx,
-            "credential",
+            category,
             "full",
             {"one_more": "value"},
             updated_by=ctx.user.user_id,
         )
 
-    current = await privacy.get_current(ctx, "credential", "full")
+    current = await privacy.get_current(ctx, category, "full")
     assert current is not None
     assert current.version == 1
     assert current.values == original
@@ -471,3 +476,24 @@ def test_placeholderization_preserves_quoted_value_matching():
     assert result.sanitized_content == (
         'note: use "{{ov_privacy:skill:quoted-skill:api_key}}" in prose\n'
     )
+
+
+@pytest.mark.asyncio
+async def test_patch_preserves_equal_fields_and_rotates_only_named_field(monkeypatch):
+    category = "credential"
+    from unittest.mock import AsyncMock
+
+    privacy = UserPrivacyConfigService(_MemoryPrivacyStorage())
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+    await privacy.upsert(ctx, category, "demo", {"a": "old-secret", "b": "new-secret"})
+    read = AsyncMock(wraps=privacy.get_current)
+    monkeypatch.setattr(privacy, "get_current", read)
+    current = await privacy.patch_values(
+        ctx, category, "demo", {"a": "new-secret", "c": "new-secret"}
+    )
+    assert current.values == {"a": "new-secret", "b": "new-secret", "c": "new-secret"}
+    read.assert_awaited_once()
+    rotated = await privacy.patch_values(ctx, category, "demo", {"a": "rotated-secret"})
+    assert rotated.values == {"a": "rotated-secret", "b": "new-secret", "c": "new-secret"}
+    previous = await privacy.get_version(ctx, category, "demo", current.version)
+    assert previous.values == current.values

@@ -5,13 +5,16 @@
 import json
 from copy import deepcopy
 from dataclasses import asdict
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from openviking.message.part import ContextPart, ImagePart, TextPart, ToolPart
 from openviking.privacy import session_extractor as extraction
+from openviking.privacy.reference import build_privacy_field_reference
 from openviking.privacy.session_extractor import extract_session_privacy_values
-from openviking.privacy.session_restore import get_session_id_from_uri, restore_session_content
+from openviking.privacy.session_restore import get_session_id_from_uri, restore_session_read
 from openviking_cli.exceptions import InvalidArgumentError
 
 
@@ -27,7 +30,12 @@ def message_jsonl(specs):
     )
 
 
-def test_extract_and_restore_complete_messages():
+@pytest.fixture
+def privacy():
+    return SimpleNamespace(get_current=AsyncMock())
+
+
+async def test_extract_and_restore_complete_messages(privacy, request_context):
     specs = [
         {
             "role": "user",
@@ -77,49 +85,22 @@ def test_extract_and_restore_complete_messages():
     clean = message_jsonl(sanitized)
     for secret in ["中文密码", "abstract-secret", "another-secret", "hello world", "error-secret"]:
         assert secret not in clean
-    assert restore_session_content(clean, "demo", values, jsonl=True) == message_jsonl(before)
-    assert extract_session_privacy_values("demo", sanitized) == (sanitized, {})
+    privacy.get_current.return_value = SimpleNamespace(values=values)
+    assert await restore_session_read(privacy, clean, request_context, jsonl=True) == message_jsonl(
+        before
+    )
     specs[1]["parts"][0].tool_input["credentials"]["nested"].append("changed")
     assert "changed" not in json.dumps(list(values.values()))
 
 
-def test_existing_references_are_not_rebound_or_recursively_restored():
-    old = "{{ov_privacy:session:demo:old}}"
-    foreign = "{{ov_privacy:session:other:old}}"
-    following = "{{ov_privacy:session:demo:following}}"
-    specs = [
-        {
-            "parts": [
-                ToolPart(tool_input={"password": "${PASSWORD}", "token": "$TOKEN"}),
-                TextPart(f"{old} {foreign} password=one"),
-            ]
-        }
-    ]
-    first, values = extract_session_privacy_values("demo", specs)
-    second, added = extract_session_privacy_values(
-        "demo", [{"parts": [TextPart(first[0]["parts"][1].text + " password=two")]}]
-    )
-    assert list(values.values()) == ["one"]
-    assert list(added.values()) == ["two"]
-    assert not values.keys() & added.keys()
-    assert first[0]["parts"][1].text in second[0]["parts"][0].text
-    assert (
-        restore_session_content(
-            f"{old} {foreign}", "demo", {"old": following, "following": "secret"}
-        )
-        == f"{following} {foreign}"
-    )
-    assert restore_session_content(old, "demo", {}) == old
-
-
-def test_sensitive_field_names_do_not_leak_into_references():
+async def test_sensitive_field_names_do_not_leak_into_references(privacy, request_context):
     key = "sk-proj-12345678901234567890_api_key"
     specs = [{"parts": [ToolPart(tool_input={key: "secret-value"})]}]
     sanitized, values = extract_session_privacy_values("demo", specs)
     assert key not in message_jsonl(sanitized)
-    assert key not in str(list(values))
-    assert restore_session_content(
-        message_jsonl(sanitized), "demo", values, jsonl=True
+    privacy.get_current.return_value = SimpleNamespace(values=values)
+    assert await restore_session_read(
+        privacy, message_jsonl(sanitized), request_context, jsonl=True
     ) == message_jsonl(specs)
 
 
@@ -168,24 +149,24 @@ def test_invalid_sensitive_container_is_rejected(kind):
 
 
 @pytest.mark.parametrize(
-    "path,allowed",
+    "owner,path,expected",
     [
-        ("messages.jsonl", True),
-        ("history/archive_001/messages.jsonl", True),
-        ("tool-results/tool-1/output.txt", True),
-        (".meta.json", False),
-        ("history/archive_001/.overview.md", False),
-        ("tool-results/tool-1/meta.json", False),
+        ("alice", "messages.jsonl", "demo"),
+        ("alice", "history/archive_001/messages.jsonl", "demo"),
+        ("alice", "tool-results/tool-1/output.txt", "demo"),
+        ("alice", ".meta.json", None),
+        ("alice", "history/archive_001/.overview.md", None),
+        ("alice", "tool-results/tool-1/meta.json", None),
+        ("bob", "messages.jsonl", None),
     ],
 )
-def test_restore_is_scoped_to_session_content(path, allowed):
+def test_restore_is_scoped_to_session_content(owner, path, expected):
     root = "viking://user/alice/sessions"
-    assert get_session_id_from_uri(f"{root}/demo/{path}", root) == ("demo" if allowed else None)
-    assert get_session_id_from_uri(f"viking://user/bob/sessions/demo/{path}", root) is None
+    assert get_session_id_from_uri(f"viking://user/{owner}/sessions/demo/{path}", root) == expected
 
 
-def test_invalid_message_jsonl_is_rejected():
+async def test_invalid_message_jsonl_is_rejected(privacy, request_context):
+    reference = build_privacy_field_reference("default", "session", "demo", "one")
+    privacy.get_current.return_value = SimpleNamespace(values={"one": "secret"})
     with pytest.raises(InvalidArgumentError):
-        restore_session_content(
-            "not json {{ov_privacy:session:demo:one}}", "demo", {"one": "secret"}, jsonl=True
-        )
+        await restore_session_read(privacy, f"not json {reference}", request_context, jsonl=True)

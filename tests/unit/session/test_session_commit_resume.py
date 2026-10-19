@@ -67,10 +67,11 @@ class _MemoryVikingFS:
     async def read_file(self, uri, ctx=None):
         if uri not in self.files:
             raise FileNotFoundError(uri)
-        return self.files[uri]
+        content = self.files[uri]
+        return content.decode("utf-8") if isinstance(content, bytes) else content
 
     async def write_file(self, uri, content, ctx=None, lease_ref=None):
-        self.files[uri] = content
+        self.files[uri] = content.decode("utf-8") if isinstance(content, bytes) else content
 
     async def append_file(self, uri, content, ctx=None):
         self.files[uri] += content
