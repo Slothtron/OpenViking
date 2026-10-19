@@ -110,6 +110,24 @@ task, err := client.Compile(
 
 :::
 
+### 目标配置与操作历史
+
+这些接口使用当前账号和认证上下文。`to` 为已注册目标的 `viking://` URI。读取或更新单个目标需要写权限；目标列表仅返回有访问权限的目标。
+
+| HTTP API | 返回结果（`status: "ok"`） |
+|----------|--------------------------|
+| `GET /api/v1/compile/config?to={to}` | `result` 包含目标配置和运行状态 |
+| `POST /api/v1/compile/config/update` | `result` 包含更新后的配置和运行状态 |
+| `GET /api/v1/compile/configs` | `result.targets` 包含可见目标摘要 |
+| `GET /api/v1/compile/operations?to={to}` | `result.operations` 按时间倒序返回操作记录；`result.next_cursor` 用于翻页 |
+| `GET /api/v1/compile/operations/{operation_id}/outputs?to={to}` | `result.outputs` 按 URI 排序返回产出文件及冻结版本引用；`result.next_cursor` 用于翻页 |
+
+更新请求体必填 `to`、`from`（非空来源 URI 数组）、`skill`、`auto_update`（布尔值）和 `update_schedule`。可选 `instruction` 省略时保留已保存的值，传 `null` 或空字符串时清空。更新配置不提交 Compile 任务。
+
+`update_schedule` 必填 `frequency`（`daily` 或 `weekly`）。可选 `hour`（0–23）和 `minute`（0–59）默认均为 0。每周计划还接受 `weekday`（1 为周一，7 为周日，默认 1）。计划使用 `Asia/Shanghai` 时区。
+
+两个历史接口均接受可选查询参数 `limit`（1–100，默认 20）和 `cursor`。翻页时原样传入返回的 `next_cursor`，其为 `null` 时表示最后一页。`operation_id` 长度为 1–128 个字符，以字母或数字开头，其余字符允许字母、数字、`:`、`.`、`_` 和 `-`。目标删除后仍可查询操作记录。目标、操作或产出清单不存在时返回 `404`；产出结果中的 `versions_available: false` 表示冻结版本不可用。
+
 ### 检查 Compile 可用性
 
 ```http
