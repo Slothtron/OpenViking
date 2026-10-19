@@ -525,6 +525,35 @@ With `dry_run=true`, only the planned diff is returned and nothing is written. D
 
 ---
 
+### Single-file version restore (HTTP API)
+
+`POST /api/v1/snapshot/restore` also restores historical content of a Compile output file. This mode requires the following three fields and cannot be combined with `project_dir` or `source_commit`:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| path | str | `viking://` URI of the Compile output file |
+| restore_version | str | Historical version supplying the restored content, such as `v1` |
+| current_version | str | Current version that must match before writing, such as `v2`; a mismatch returns `409 CONFLICT` with `error.details.resource: "VERSION_CONFLICT"` |
+
+Call `GET /api/v1/snapshot/versions?uri=<file URI>` to obtain `current_version` and the version history before submitting a restore:
+
+```bash
+curl -X POST "http://localhost:1933/api/v1/snapshot/restore" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{
+    "path": "viking://resources/wiki/entity/project.md",
+    "restore_version": "v1",
+    "current_version": "v2"
+  }'
+```
+
+When v1 differs from the current content, restoring creates v3 with v1's content and preserves the history of v1 and v2. The response contains `version_id: "v3"` and `restored_from: "v1"`. Identical content returns `result: "noop"` without creating a version.
+
+Only the specified file is restored; related Wiki pages and index content retain their current content. A running Compile on the target returns `409 CONFLICT` with `error.details.resource: "COMPILE_RUNNING"`. This mode does not provide a `dry_run` preview; directory restore preview options do not apply to single-file restore.
+
+---
+
 ## Ignore management
 
 The `.ovgitignore` file at the account root is an account-level exclusion file. At `commit` time, files matching the rules are excluded from the snapshot; the rules file itself is never ignored by `.ovgitignore` rules (a rule matching `.ovgitignore` does not exclude it) and never enters vector indexing. Rules affect only `commit`, not `restore`/`show`/`log`.

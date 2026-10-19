@@ -10,7 +10,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Body, Depends, Query
 from fastapi.responses import Response as FastAPIResponse
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from openviking.core.uri_validation import validate_request_viking_uri
 from openviking.pyagfs.exceptions import (
@@ -98,9 +98,7 @@ async def log(
         else None
     )
     try:
-        result = await service.fs.log(
-            branch=branch, limit=limit, paths=canonical_paths, ctx=_ctx
-        )
+        result = await service.fs.log(branch=branch, limit=limit, paths=canonical_paths, ctx=_ctx)
     except AGFSNotFoundError:
         raise NotFoundError(branch, "git_ref")
     except (AGFSClientError, ValueError) as e:
@@ -112,20 +110,19 @@ async def log(
 
 
 class RestoreRequest(BaseModel):
-    """Request body for ``POST /api/v1/snapshot/restore``.
-
-    Either a directory restore (``project_dir`` / ``source_commit``) or a
-    single Compile output file restore (``path`` + ``source_version`` +
-    ``expected_version``).
-    """
+    """Restore a directory snapshot or one Compile output file; modes cannot be mixed."""
 
     model_config = ConfigDict(extra="forbid")
 
     project_dir: Optional[str] = None
     source_commit: Optional[str] = None
     path: Optional[str] = None
-    source_version: Optional[str] = None
-    expected_version: Optional[str] = None
+    restore_version: Optional[str] = Field(
+        None, description="Historical version supplying the restored content"
+    )
+    current_version: Optional[str] = Field(
+        None, description="Required current version; mismatch returns a conflict"
+    )
     branch: str = "main"
     dry_run: bool = False
     message: Optional[str] = None
@@ -137,8 +134,8 @@ class RestoreRequest(BaseModel):
         if self.path is not None:
             if self.project_dir is not None or self.source_commit is not None:
                 raise ValueError("path cannot be combined with project_dir or source_commit")
-            if not self.source_version or not self.expected_version:
-                raise ValueError("path requires source_version and expected_version")
+            if not self.restore_version or not self.current_version:
+                raise ValueError("path requires restore_version and current_version")
         elif not self.source_commit:
             raise ValueError("source_commit is required")
         return self
@@ -169,7 +166,10 @@ async def restore(
     if request.path is not None:
         path = validate_request_viking_uri(request.path, _ctx, field_name="path")
         result = await service.compile.restore_file_version(
-            path, request.source_version, request.expected_version, _ctx
+            uri=path,
+            restore_version=request.restore_version,
+            current_version=request.current_version,
+            ctx=_ctx,
         )
         return Response(status="ok", result=result)
     project_dir = (
@@ -211,9 +211,7 @@ async def restore(
         # With GitRestoreWritebackPartialError wired up, structured partial
         # failures now go through the branch above; this clause only catches
         # the degraded path.
-        raise InternalError(
-            f"snapshot restore failed: {e}", cause=e
-        ) from e
+        raise InternalError(f"snapshot restore failed: {e}", cause=e) from e
     return Response(status="ok", result=result)
 
 

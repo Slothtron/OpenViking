@@ -1378,22 +1378,23 @@ class CompileVersions:
     async def restore(
         self,
         uri: str,
-        source_version: str,
-        expected_version: str,
+        restore_version: str,
+        current_version: str,
         ctx: RequestContext,
         write: Callable[[bytes, Callable[..., Awaitable[Any]]], Awaitable[Any]],
     ) -> Dict[str, Any]:
-        """Restore immutable historical bytes as a new version before refresh.
+        """Restore ``uri`` from ``restore_version`` under the content lock.
 
-        Check ``expected_version`` under the content lock before writing.
+        ``current_version`` must match; active Compile or mismatch raises ConflictError.
+        ``write`` persists and refreshes as ``ctx``; return new version metadata or noop.
         """
         await self._fs._ensure_access(uri, ctx, action=AclAction.WRITE)
         record = await self._managed(uri, ctx)
         path = self._path(ctx.account_id, record["id"], uri)
         index = await self._store.read_json(path) or {"versions": []}
-        source = next((v for v in index["versions"] if v["version_id"] == source_version), None)
+        source = next((v for v in index["versions"] if v["version_id"] == restore_version), None)
         if source is None:
-            raise NotFoundError(source_version, "file version")
+            raise NotFoundError(restore_version, "file version")
         content = await self._fs.show(source["snapshot_id"], path=source["snapshot_path"], ctx=ctx)
         result: Dict[str, Any] = {}
 
@@ -1405,14 +1406,14 @@ class CompileVersions:
                     raise ConflictError("Compile is running", resource="COMPILE_RUNNING")
                 index = await self._store.read_json(path) or {"versions": []}
                 current = index["versions"][-1]["version_id"] if index["versions"] else None
-                if current != expected_version:
+                if current != current_version:
                     raise ConflictError(
-                        f"Current version is {current}, not {expected_version}",
+                        f"Current version is {current}, not {current_version}",
                         resource="VERSION_CONFLICT",
                     )
                 written = await write()
                 snapshot = await self._commit(
-                    uris, f"restore {uri} to {source_version}", ctx, lease_ref=lease_ref
+                    uris, f"restore {uri} to {restore_version}", ctx, lease_ref=lease_ref
                 )
             if not snapshot or not await self._changed(ctx.account_id, target_id, uri, snapshot):
                 result.update(uri=uri, version_id=current, restored_from=None, result="noop")
@@ -1425,13 +1426,13 @@ class CompileVersions:
                     {
                         "source": "restore",
                         "actor": ctx.user.user_id,
-                        "restored_from": source_version,
+                        "restored_from": restore_version,
                         "provenance": dict(source.get("provenance") or {}),
                     },
                     source_roots=list(index.get("source_roots") or [uri]),
                 )
                 result.update(
-                    uri=uri, version_id=version["version_id"], restored_from=source_version
+                    uri=uri, version_id=version["version_id"], restored_from=restore_version
                 )
             return written
 

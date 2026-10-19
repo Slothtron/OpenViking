@@ -525,6 +525,35 @@ ov snapshot restore 3f2a1b9c viking://resources/my_project -m "restore to v1" -o
 
 ---
 
+### 单文件版本恢复（HTTP API）
+
+`POST /api/v1/snapshot/restore` 也支持恢复 Compile 产物文件的历史内容。该模式使用以下三个必填字段，不与 `project_dir`、`source_commit` 混用：
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| path | str | Compile 产物文件的 `viking://` URI |
+| restore_version | str | 提供恢复内容的历史版本，例如 `v1` |
+| current_version | str | 写入前要求匹配的当前版本，例如 `v2`；不匹配时返回 `409 CONFLICT`，`error.details.resource` 为 `VERSION_CONFLICT` |
+
+先调用 `GET /api/v1/snapshot/versions?uri=<文件 URI>` 获取 `current_version` 和历史版本列表，再提交恢复请求：
+
+```bash
+curl -X POST "http://localhost:1933/api/v1/snapshot/restore" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{
+    "path": "viking://resources/wiki/entity/project.md",
+    "restore_version": "v1",
+    "current_version": "v2"
+  }'
+```
+
+当 v1 与当前内容不同时，恢复会生成新版本 v3，内容取自 v1；v1、v2 的历史记录保留。响应中的 `version_id` 为 `v3`，`restored_from` 为 `v1`。内容相同时返回 `result: "noop"`，不新增版本。
+
+仅指定文件被恢复；相关 Wiki 页面和索引正文保持原内容。目标存在运行中的 Compile 时，返回 `409 CONFLICT`，`error.details.resource` 为 `COMPILE_RUNNING`。此模式不提供 `dry_run` 预演；目录恢复的预演参数不适用于单文件恢复。
+
+---
+
 ## ignore 管理
 
 账号根目录下的 `.ovgitignore` 是账号级排除规则文件。在 `commit` 时，匹配规则的文件被排除出快照；规则文件本身不会被 `.ovgitignore` 规则忽略（即使规则匹配 `.ovgitignore` 也不会被排除），且不进入向量索引。规则只影响 `commit`，不影响 `restore`/`show`/`log`。

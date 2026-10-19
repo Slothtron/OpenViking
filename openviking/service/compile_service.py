@@ -666,8 +666,13 @@ class CompileService:
         )
 
     async def restore_file_version(
-        self, uri: str, source_version: str, expected_version: str, ctx: RequestContext
+        self, uri: str, restore_version: str, current_version: str, ctx: RequestContext
     ) -> dict[str, Any]:
+        """Restore ``uri`` from ``restore_version`` if ``current_version`` matches.
+
+        Return version metadata after refresh; mismatches or active Compile raise ConflictError.
+        """
+
         async def write(content: bytes, commit_content: Any) -> None:
             # Use normal refresh while recording a restore version.
             await self._fs.write(
@@ -679,7 +684,11 @@ class CompileService:
             )
 
         return await self._require_lifecycle().versions.restore(
-            uri, source_version, expected_version, ctx, write
+            uri=uri,
+            restore_version=restore_version,
+            current_version=current_version,
+            ctx=ctx,
+            write=write,
         )
 
     @staticmethod
