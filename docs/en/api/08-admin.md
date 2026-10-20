@@ -249,7 +249,7 @@ objects using YAML field names such as `fields[].type`. List returns
 Storage is per Account and per type:
 
 ```text
-/local/{account_id}/_system/memory_templates/
+viking://system/memory/memory_templates/custom/
   profile.yaml
   preferences.yaml
   events.yaml
@@ -264,6 +264,12 @@ encrypted backing files directly. `setting.json` and User `user_config.json`
 are unchanged. Personal deployments use the default Account; enterprise
 deployments use the target Account, with no separate kernel storage layout.
 
+Reads prefer the new path above and only fall back to
+`/local/{account_id}/_system/memory_templates/{type}.yaml` when the new file is
+absent. Reads never migrate or rewrite files. If the higher-priority file is
+damaged, the server reports an error instead of silently falling back to the
+lower-priority file or deployment defaults.
+
 Template reads do not acquire locks. Publication writes a unique staging file in
 the same directory, then switches the active path through AGFS: LocalFS uses a
 file rename; S3 copies the complete object over the destination before deleting
@@ -271,11 +277,15 @@ the staging object, without deleting the destination first. Readers may see the
 complete old or new version, or deployment defaults before the first publication
 and after DELETE. This is per-file publication, not a transaction across an
 entire template listing or registry snapshot.
-Writers/DELETE still use cross-process locks; publication locks cover both the
-active and staging paths. Contention uses zero-wait attempts with asynchronous
+Writers/DELETE still use cross-process locks; publication locks cover the new,
+legacy, and staging paths. PUT publishes only to the new path and removes the
+legacy file after publication succeeds. DELETE removes the legacy file before
+the new file so that an old override cannot become active again. Explicit
+PUT/DELETE requests may replace or remove damaged content after backing up its
+original bytes. Contention uses zero-wait attempts with asynchronous
 backoff for up to 10 seconds, leaving executor threads available for I/O/release.
-A failed staging write leaves the active file unchanged. Post-publication cleanup
-errors only produce warnings, never an in-place rollback. If the move reports an
+A failed staging write leaves the active file unchanged. Post-publication staging
+cleanup errors only produce warnings, never an in-place rollback. If the move reports an
 error, the destination is checked: a verified publication is retained; an
 unverifiable outcome returns an error without blindly restoring the old version.
 Use GET to confirm its state. Cancellation stops lock retries, but already

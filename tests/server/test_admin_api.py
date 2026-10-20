@@ -47,6 +47,7 @@ from openviking.service.task_work_index import (
 from openviking.session.memory.account_templates import (
     EDITABLE_MEMORY_TEMPLATE_FIELDS,
     account_memory_template_path,
+    legacy_account_memory_template_path,
     resolve_account_memory_registry,
 )
 from openviking.session.memory.extract_loop import ExtractLoop
@@ -1805,7 +1806,7 @@ async def test_account_memory_templates_reject_oversized_serialized_config(
     assert fs.agfs._files == original
 
 
-async def test_account_memory_templates_corrupt_storage_is_not_overwritten(
+async def test_account_memory_templates_read_rejects_corrupt_storage_but_writes_can_recover(
     lightweight_admin_client,
     lightweight_admin_app,
     template_account,
@@ -1813,19 +1814,177 @@ async def test_account_memory_templates_corrupt_storage_is_not_overwritten(
     account_id, headers = template_account
     fs = lightweight_admin_app.state.fake_service.viking_fs
     path = account_memory_template_path(account_id, "profile")
-    fs.agfs._files[path] = b'{"invalid-json"'
-    original = dict(fs.agfs._files)
     url = f"/api/v1/admin/accounts/{account_id}/memory-templates/profile"
-    for method in ("GET", "PUT", "DELETE"):
-        response = await lightweight_admin_client.request(
-            method,
-            url,
-            headers=headers,
-            **({"json": {"description": "New"}} if method == "PUT" else {}),
-        )
-        assert response.status_code == 412, response.text
-        assert response.json()["error"]["code"] == "FAILED_PRECONDITION"
-        assert fs.agfs._files == original
+    corrupt = b'{"invalid-json"'
+
+    fs.agfs._files[path] = corrupt
+    response = await lightweight_admin_client.get(url, headers=headers)
+    assert response.status_code == 412, response.text
+    assert response.json()["error"]["code"] == "FAILED_PRECONDITION"
+    assert fs.agfs._files[path] == corrupt
+
+    response = await lightweight_admin_client.put(
+        url, headers=headers, json={"description": "Recovered"}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["result"]["effective"]["description"] == "Recovered"
+    assert fs.agfs._files[path + ".backup"] == corrupt
+
+    fs.agfs._files[path] = corrupt
+    response = await lightweight_admin_client.delete(url, headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["result"]["status"] == "system_default"
+    assert path not in fs.agfs._files
+    assert fs.agfs._files[path + ".backup"] == corrupt
+
+
+async def test_account_memory_templates_read_legacy_without_side_effect_then_migrate_on_put(
+    lightweight_admin_client,
+    lightweight_admin_app,
+    template_account,
+):
+    account_id, headers = template_account
+    client = lightweight_admin_client
+    url = f"/api/v1/admin/accounts/{account_id}/memory-templates/profile"
+    fs = lightweight_admin_app.state.fake_service.viking_fs
+    path = account_memory_template_path(account_id, "profile")
+    legacy_path = legacy_account_memory_template_path(account_id, "profile")
+
+    published = await client.put(url, headers=headers, json={"description": "Legacy"})
+    assert published.status_code == 200, published.text
+    original = fs.agfs._files.pop(path)
+    fs.agfs._files[legacy_path] = original
+
+    read = await client.get(url, headers=headers)
+    assert read.status_code == 200, read.text
+    assert read.json()["result"]["effective"]["description"] == "Legacy"
+    assert path not in fs.agfs._files
+    assert fs.agfs._files[legacy_path] == original
+
+    migrated = await client.put(
+        url, headers=headers, json=read.json()["result"]["effective"]
+    )
+    assert migrated.status_code == 200, migrated.text
+    assert migrated.json()["result"]["effective"]["description"] == "Legacy"
+    assert path in fs.agfs._files
+    assert legacy_path not in fs.agfs._files
+    assert fs.agfs._files[path + ".backup"] == original
+
+
+async def test_account_memory_templates_invalid_new_path_does_not_fallback_to_legacy(
+    lightweight_admin_client,
+    lightweight_admin_app,
+    template_account,
+):
+    account_id, headers = template_account
+    client = lightweight_admin_client
+    url = f"/api/v1/admin/accounts/{account_id}/memory-templates/profile"
+    fs = lightweight_admin_app.state.fake_service.viking_fs
+    path = account_memory_template_path(account_id, "profile")
+    legacy_path = legacy_account_memory_template_path(account_id, "profile")
+
+    published = await client.put(url, headers=headers, json={"description": "Legacy"})
+    assert published.status_code == 200, published.text
+    fs.agfs._files[legacy_path] = fs.agfs._files[path]
+    fs.agfs._files[path] = b"invalid: ["
+
+    response = await client.get(url, headers=headers)
+    assert response.status_code == 412, response.text
+    assert response.json()["error"]["code"] == "FAILED_PRECONDITION"
+
+
+async def test_account_memory_templates_retry_cleans_legacy_after_published_migration(
+    lightweight_admin_client,
+    lightweight_admin_app,
+    template_account,
+    monkeypatch,
+):
+    account_id, headers = template_account
+    client = lightweight_admin_client
+    url = f"/api/v1/admin/accounts/{account_id}/memory-templates/profile"
+    fs = lightweight_admin_app.state.fake_service.viking_fs
+    path = account_memory_template_path(account_id, "profile")
+    legacy_path = legacy_account_memory_template_path(account_id, "profile")
+
+    published = await client.put(url, headers=headers, json={"description": "Legacy"})
+    assert published.status_code == 200, published.text
+    fs.agfs._files[legacy_path] = fs.agfs._files.pop(path)
+    remove = fs.agfs.rm
+    failed = False
+
+    def fail_legacy_cleanup_once(target, **kwargs):
+        nonlocal failed
+        if target == legacy_path and not failed:
+            failed = True
+            raise OSError("legacy cleanup failed")
+        return remove(target, **kwargs)
+
+    monkeypatch.setattr(fs.agfs, "rm", fail_legacy_cleanup_once)
+    response = await client.put(url, headers=headers, json={"description": "Current"})
+    assert response.status_code == 412, response.text
+    assert response.json()["error"]["details"] == {
+        "published": True,
+        "legacy_cleanup_pending": True,
+        "retryable": True,
+    }
+    assert path in fs.agfs._files
+    assert legacy_path in fs.agfs._files
+    current = (await client.get(url, headers=headers)).json()["result"]
+    assert current["effective"]["description"] == "Current"
+
+    retry = await client.put(url, headers=headers, json={"description": "Current"})
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["result"]["updated_at"] == current["updated_at"]
+    assert legacy_path not in fs.agfs._files
+
+
+async def test_account_memory_templates_reset_removes_legacy_before_current(
+    lightweight_admin_client,
+    lightweight_admin_app,
+    template_account,
+    monkeypatch,
+):
+    account_id, headers = template_account
+    client = lightweight_admin_client
+    url = f"/api/v1/admin/accounts/{account_id}/memory-templates/profile"
+    fs = lightweight_admin_app.state.fake_service.viking_fs
+    path = account_memory_template_path(account_id, "profile")
+    legacy_path = legacy_account_memory_template_path(account_id, "profile")
+
+    published = await client.put(url, headers=headers, json={"description": "Current"})
+    assert published.status_code == 200, published.text
+    current = fs.agfs._files[path]
+    fs.agfs._files[legacy_path] = current
+    remove = fs.agfs.rm
+    removed = []
+    failed = False
+
+    def fail_legacy_cleanup_once(target, **kwargs):
+        nonlocal failed
+        removed.append(target)
+        if target == legacy_path and not failed:
+            failed = True
+            raise OSError("legacy cleanup failed")
+        return remove(target, **kwargs)
+
+    monkeypatch.setattr(fs.agfs, "rm", fail_legacy_cleanup_once)
+    response = await client.delete(url, headers=headers)
+    assert response.status_code == 412, response.text
+    assert response.json()["error"]["details"] == {
+        "legacy_cleanup_pending": True,
+        "retryable": True,
+    }
+    assert removed == [legacy_path]
+    assert fs.agfs._files[path] == current
+    assert fs.agfs._files[legacy_path] == current
+
+    response = await client.delete(url, headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["result"]["status"] == "system_default"
+    assert removed[-2:] == [legacy_path, path]
+    assert path not in fs.agfs._files
+    assert legacy_path not in fs.agfs._files
+    assert fs.agfs._files[path + ".backup"] == current
 
 
 async def test_create_account(

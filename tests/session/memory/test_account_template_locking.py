@@ -12,13 +12,16 @@ import pytest
 from openviking.pyagfs import AGFSNotFoundError
 from openviking.session.memory.account_templates import (
     account_memory_template_path,
+    account_memory_template_uri,
     default_memory_template,
+    legacy_account_memory_template_path,
     read_account_memory_template,
     resolve_account_memory_registry,
     update_account_memory_template,
 )
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
+from openviking_cli.exceptions import FailedPreconditionError
 
 
 class LockingAGFS:
@@ -304,7 +307,7 @@ def test_waiting_writer_does_not_block_readers_or_leak_locks(monkeypatch, cancel
             else:
                 with pytest.raises(ResourceBusyError) as exc:
                     await writer
-                assert exc.value.uri == path
+                assert exc.value.uri == account_memory_template_uri("profile")
                 assert exc.value.conflict_type == "memory_templates_busy"
         assert agfs.timeouts and set(agfs.timeouts) == {0.0}
         assert not agfs.leases
@@ -379,6 +382,7 @@ def test_saving_defaults_uses_locked_reset_and_preserves_failed_writes(monkeypat
     fs = SimpleNamespace(agfs=agfs)
     registry = MemoryTypeRegistry()
     path = account_memory_template_path("locking-test", "profile")
+    legacy_path = legacy_account_memory_template_path("locking-test", "profile")
 
     async def run():
         await update_account_memory_template(
@@ -395,6 +399,8 @@ def test_saving_defaults_uses_locked_reset_and_preserves_failed_writes(monkeypat
             return write(target, data, **kwargs)
 
         def checked_remove(target, **kwargs):
+            if target == legacy_path:
+                return remove(target, **kwargs)
             assert target == path
             assert agfs.files[path + ".backup"] == previous
             if failure == "remove":
@@ -406,8 +412,12 @@ def test_saving_defaults_uses_locked_reset_and_preserves_failed_writes(monkeypat
         update = update_account_memory_template(
             fs, "locking-test", "profile", default_memory_template(registry, "profile"), registry
         )
-        if failure:
+        if failure == "backup":
             with pytest.raises(OSError, match=f"{failure} failed"):
+                await update
+            assert agfs.files[path] == previous
+        elif failure == "remove":
+            with pytest.raises(FailedPreconditionError, match="current memory template"):
                 await update
             assert agfs.files[path] == previous
         else:
