@@ -139,6 +139,17 @@ async def project_auth_config(args: Dict[str, Any], ctx: RequestContext) -> Dict
     return {"user_access_token": credentials["access_token"], "user_key": user_key.strip()}
 
 
+async def document_auth_config(args: Dict[str, Any], ctx: RequestContext) -> Dict[str, Any]:
+    """Resolve enumeration credentials and retain a private reference for child imports."""
+    validate_feishu_auth_args(args)
+    if "auth_config" in args:
+        raise InvalidArgumentError("OAuth references cannot be combined with auth_config.")
+    reference = validate_oauth_ref(args[OAUTH_REF_ARG], ctx.user.user_id)
+    provider = ExternalFeishuToken(reference, ctx.api_key or "")
+    token = await asyncio.to_thread(provider.get_token)
+    return {"lark_access_token": token, OAUTH_REF_ARG: reference}
+
+
 def is_external_feishu_auth(state: Optional[Dict[str, Any]]) -> bool:
     return isinstance(state, dict) and state.get("provider") == EXTERNAL_FEISHU_PROVIDER
 
