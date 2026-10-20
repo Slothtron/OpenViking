@@ -247,6 +247,7 @@ openviking_gateway = ["client-rules.json"]
 "vikingbot.studio.providers.feishu" = ["icon.png"]
 openviking = [
     "prompts/templates/**/*.yaml",
+    "system_assets/**/*",
     "server/static/**/*",
     "web_studio/dist/**/*",
     "lib/ragfs_python*.so",
