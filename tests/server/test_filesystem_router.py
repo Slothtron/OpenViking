@@ -215,6 +215,32 @@ async def test_attrs_returns_memory_fields_and_tags(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_system_attrs_returns_empty_tags_without_querying_vector_store(monkeypatch):
+    uri = "viking://system/memory/memory_templates/custom/demo.md"
+    stat = AsyncMock(return_value={"isDir": False})
+    vector_filter = AsyncMock(side_effect=AssertionError("system attrs must not query vectors"))
+    monkeypatch.setattr(
+        filesystem,
+        "get_service",
+        lambda: SimpleNamespace(
+            fs=SimpleNamespace(stat=stat),
+            vikingdb_manager=SimpleNamespace(filter=vector_filter),
+        ),
+    )
+    ctx = RequestContext(user=UserIdentifier("acct", "alice"), role=Role.USER)
+
+    response = await filesystem.attrs(uri=uri, _ctx=ctx)
+
+    assert response.result == {
+        "uri": uri,
+        "context_type": "resource",
+        "attrs": {"tags": []},
+    }
+    stat.assert_awaited_once_with(uri, ctx=ctx, skip_count=True)
+    vector_filter.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("role", [Role.USER, Role.ADMIN, Role.ROOT])
 async def test_mkdir_echoes_canonical_home_alias(monkeypatch, role):
     seen = {}
@@ -373,6 +399,33 @@ async def test_ls_user_container_lists_only_caller_space(app, client, service):
     names = {entry["name"] for entry in response.json()["result"]}
     assert names == {"alice"}
     assert response.json()["has_more"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["ls", "tree"])
+async def test_system_listing_default_http_output_uses_only_physical_metadata(
+    app, client, service, endpoint
+):
+    root = "viking://system/memory/memory_templates/custom/http-default"
+    child = f"{root}/demo"
+    root_ctx = RequestContext(user=UserIdentifier("default", "default"), role=Role.ROOT)
+    await service.viking_fs.mkdir(child, exist_ok=True, ctx=root_ctx)
+
+    app.dependency_overrides[get_request_context] = lambda: RequestContext(
+        user=UserIdentifier("default", "alice"), role=Role.USER
+    )
+    try:
+        response = await client.get(
+            f"/api/v1/fs/{endpoint}",
+            params={"uri": root},
+        )
+    finally:
+        app.dependency_overrides.pop(get_request_context, None)
+
+    assert response.status_code == 200, response.text
+    entries = response.json()["result"]
+    assert entries
+    assert all("abstract" not in entry and "overview" not in entry for entry in entries)
 
 
 @pytest.mark.asyncio

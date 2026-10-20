@@ -25,6 +25,7 @@ from openviking.core.namespace import (
     is_session_uri,
     owner_space_for_uri,
 )
+from openviking.core.namespace_policy import namespace_policy_for_uri
 from openviking.server.dependencies import get_service
 from openviking.server.identity import RequestContext
 from openviking.service.task_tracker import TaskStatus, get_task_tracker
@@ -201,6 +202,8 @@ class ReindexExecutor:
         tag_mode: str = "replace",
         ctx: RequestContext,
     ) -> dict[str, Any]:
+        if not namespace_policy_for_uri(uri).supports_reindex:
+            raise InvalidArgumentError(f"reindex is not supported for namespace: {uri}")
         object_type = self._infer_target_type(uri)
         self._validate_mode(object_type, mode)
         if not recursive and object_type in {

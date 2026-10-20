@@ -49,6 +49,11 @@ class _PathLockClient:
         self.held = True
         return {"lease_ref": "lock-1"}
 
+    async def pathlock_acquire_exact(self, path):
+        self.paths = [path]
+        self.held = True
+        return {"lease_ref": "lock-1"}
+
     async def pathlock_to_handoff(self, lease):
         assert lease == {"lease_ref": "lock-1"}
         assert self.held is True
@@ -121,6 +126,97 @@ class _VFS:
         except UnicodeDecodeError:
             self.files[uri] = content
         self.writes.append(uri)
+
+
+@pytest.mark.asyncio
+async def test_system_write_is_file_only_without_queue_work(
+    _coordinator_queue_for_unit_tests,
+):
+    root = "viking://system/memory/memory_templates/custom/demo"
+    uri = f"{root}/template.md"
+    vfs = _VFS(root)
+    coordinator = ContentWriteCoordinator(vfs)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ADMIN)
+
+    result = await coordinator.write(
+        uri=uri,
+        content="template",
+        ctx=ctx,
+        wait=True,
+    )
+
+    assert vfs.files[uri] == "template"
+    assert vfs._async_agfs.releases == 1
+    assert vfs._async_agfs.handoffs == 0
+    assert result["root_uri"] == root
+    assert result["semantic_status"] == "skipped"
+    assert result["vector_status"] == "skipped"
+    assert result["queue_status"] is None
+    _coordinator_queue_for_unit_tests.enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_system_batch_write_is_file_only_without_queue_work(
+    _coordinator_queue_for_unit_tests,
+):
+    root = "viking://system/memory/memory_templates/custom/demo"
+    first = f"{root}/first.md"
+    second = f"{root}/second.md"
+    vfs = _VFS(root, {first: "old"})
+    coordinator = ContentWriteCoordinator(vfs)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ADMIN)
+
+    result = await coordinator.batch_write(
+        root_uri=root,
+        operations=[
+            {"uri": first, "content": "new"},
+            {"uri": second, "content": "created"},
+        ],
+        ctx=ctx,
+        wait=True,
+    )
+
+    assert result["updated"] == [first]
+    assert result["created"] == [second]
+    assert result["semantic_status"] == "skipped"
+    assert result["vector_status"] == "skipped"
+    assert result["queue_status"] is None
+    assert vfs._async_agfs.releases == 1
+    assert vfs._async_agfs.handoffs == 0
+    _coordinator_queue_for_unit_tests.enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_system_write_rejects_indexed_metadata():
+    root = "viking://system/memory/memory_templates/custom/demo"
+    uri = f"{root}/template.md"
+    coordinator = ContentWriteCoordinator(_VFS(root))
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ADMIN)
+
+    with pytest.raises(InvalidArgumentError, match="tags are not supported"):
+        await coordinator.write(
+            uri=uri,
+            content="template",
+            tags=["kind=template"],
+            ctx=ctx,
+        )
+
+
+@pytest.mark.asyncio
+async def test_system_set_tags_rejects_capability_before_write_access():
+    uri = "viking://system/memory/memory_templates/custom/demo/template.md"
+    ensure_access = AsyncMock(side_effect=AssertionError("write access must not be checked"))
+    coordinator = ContentWriteCoordinator(SimpleNamespace(_ensure_access=ensure_access))
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    with pytest.raises(InvalidArgumentError, match="tags are not supported"):
+        await coordinator.set_tags(
+            uri=uri,
+            tags=["kind=template"],
+            ctx=ctx,
+        )
+
+    ensure_access.assert_not_awaited()
 
 
 @pytest.fixture(autouse=True)
