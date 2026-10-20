@@ -28,6 +28,8 @@ from openviking_cli.session.user_id import UserIdentifier
 
 
 def test_context_type_for_uri_uses_path_segments():
+    assert context_type_for_uri("viking://system") == "resource"
+    assert context_type_for_uri("viking://system/memory/memory_templates") == "resource"
     assert context_type_for_uri("viking://user/alice/memories/entities/m1.md") == "memory"
     assert context_type_for_uri("viking://user/memories/entities/m1.md") == "resource"
     assert context_type_for_uri("viking://user/alice/skills/demo") == "skill"
@@ -48,6 +50,13 @@ def test_context_type_for_uri_uses_path_segments():
     assert context_type_for_uri("viking://agent/skills/demo") == "skill"
     assert context_type_for_uri("viking://resources/memories-report.md") == "resource"
     assert context_type_for_uri("viking://user/alice/resources/skills-report.md") == "resource"
+    assert context_type_for_uri("viking://resources/system/guide.md") == "resource"
+
+
+def test_system_namespace_detection_uses_scope_segment():
+    assert classify_uri("viking://system/memory").is_system
+    assert resolve_uri("viking://system/memory").scope == "system"
+    assert not classify_uri("viking://resources/system").is_system
 
 
 def test_peer_content_target_uri_rejects_invalid_peer_id():

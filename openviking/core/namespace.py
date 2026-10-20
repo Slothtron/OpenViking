@@ -52,6 +52,10 @@ class UriClassification:
         return self.context_type == "skill"
 
     @property
+    def is_system(self) -> bool:
+        return self.scope == "system"
+
+    @property
     def is_user_namespace_root(self) -> bool:
         return _is_namespace_root_parts(self.parts, "user")
 
