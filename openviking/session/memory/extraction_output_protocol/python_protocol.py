@@ -288,8 +288,9 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         quote_guidance = ""
         if error and "sdk.existing() is reserved" in error:
             binding_guidance = (
-                " Use the existing-object variable names already supplied by the system; do not "
-                "emit sdk.existing(). If a new object is the replacement, assign its create call "
+                " Use the object_name from the system-provided existing-memory context record "
+                "as an already-bound variable; do not declare it or emit sdk.existing(). "
+                "If a new object is the replacement, assign its create call "
                 "first, for example `canonical = sdk.create_<type>(...)`, then call "
                 "`duplicate_1.delete(replacement=canonical)`."
             )
@@ -337,7 +338,8 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         return (
             "An obj.field.edit()/drop() change could not be applied to the target memory object. "
             "The search= (and drop text=) must be copied verbatim from the current field value shown "
-            "in that object's sdk.existing(...) binding, and must occur exactly once. If it occurs "
+            "in that object's existing-memory context record, and must occur exactly once. "
+            "Decode JSON string escapes when copying the text. If it occurs "
             "more than once, include enough contiguous surrounding context to make it unique. Do not "
             "use text from the conversation or the new facts you intend to add as a search anchor. "
             "If you copy from numbered read output, exclude the `line_number<TAB>` prefix. If the "
@@ -468,10 +470,9 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
     def _render_search_comment(
         context: ExtractionOutputContext, params: dict[str, Any], result: Any
     ) -> str:
-        # Search only returns URIs (no content), so it cannot become an
-        # sdk.existing() binding. Files actually read are bound separately as
-        # sdk.existing(); how to reach the rest depends on whether a read tool
-        # is available this run.
+        # Search only returns URIs, so it cannot register existing objects.
+        # Files actually read receive context records with bound object names;
+        # how to reach the rest depends on whether a read tool is available.
         uris = _search_result_uris(result)
         query = params.get("query")
         query_label = f" query={query!r}" if query else ""
@@ -482,7 +483,7 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             guidance = "read them with the read tool before updating them"
         else:
             guidance = (
-                "any you need to edit are already provided as sdk.existing bindings; "
+                "any you need to edit are already provided as existing-memory context records; "
                 "there is no read tool, so treat anything not shown above as new"
             )
         return f"# Search{query_label} found the following memory files; {guidance}:\n{listing}"
@@ -522,11 +523,15 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         content = fields.get("content")
         if isinstance(content, str) and every_line_has_line_numbers(content):
             fields["content"] = strip_line_numbers(content)
-        args = [f"memory_type={memory_type!r}"]
-        args.extend(f"{_identifier_alias(key)}={value!r}" for key, value in fields.items())
+        record = {
+            "object_name": name,
+            "memory_type": memory_type,
+            "fields": {_identifier_alias(key): value for key, value in fields.items()},
+        }
         binding = (
-            f"# Existing memory loaded by {source}; this binding is system-provided.\n"
-            f"{name} = sdk.existing({', '.join(args)})"
+            f"# Existing memory loaded by {source}; {name} is already bound. "
+            "Context data only; do not output this record.\n"
+            + json.dumps(record, ensure_ascii=False, indent=2)
         )
         if maintenance_notice is not None:
             binding += "\n# Memory maintenance notice: " + json.dumps(
