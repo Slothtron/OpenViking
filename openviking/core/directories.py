@@ -26,6 +26,7 @@ from openviking.storage.vector_ids import vector_record_id
 if TYPE_CHECKING:
     from openviking.storage import VikingDBManager
     from openviking.storage.viking_fs import VikingFS
+    from openviking.system_assets.sync import SystemAssetSynchronizer
 
 from openviking_cli.exceptions import NotFoundError
 
@@ -195,9 +196,11 @@ class DirectoryInitializer:
         self,
         vikingdb: "VikingDBManager",
         viking_fs: Optional["VikingFS"] = None,
+        system_asset_synchronizer: Optional["SystemAssetSynchronizer"] = None,
     ):
         self.vikingdb = vikingdb
         self._viking_fs = viking_fs
+        self._system_asset_synchronizer = system_asset_synchronizer
 
     def _get_viking_fs(self) -> "VikingFS":
         if self._viking_fs is not None:
@@ -208,6 +211,8 @@ class DirectoryInitializer:
 
     async def initialize_account_workspace(self, ctx: RequestContext) -> tuple[int, int]:
         """Initialize account and first-user preset directories as one batch."""
+        if self._system_asset_synchronizer is not None:
+            await self._system_asset_synchronizer.sync(ctx)
         account_roots, account_children = self._account_directory_targets(ctx)
         user_root, user_children = self._user_directory_targets(ctx)
         created = await self._initialize_directory_trees(
@@ -223,6 +228,8 @@ class DirectoryInitializer:
         Its concrete metadata belongs to ``viking://user/{user_id}`` and is
         created by ``initialize_user_directories``.
         """
+        if self._system_asset_synchronizer is not None:
+            await self._system_asset_synchronizer.sync(ctx)
         roots, children = self._account_directory_targets(ctx)
         return len(await self._initialize_directory_trees(roots, children))
 

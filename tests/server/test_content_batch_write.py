@@ -187,6 +187,36 @@ async def test_system_batch_write_is_file_only_without_queue_work(
 
 
 @pytest.mark.asyncio
+async def test_system_builtin_batch_write_accepts_binary_assets(
+    _coordinator_queue_for_unit_tests,
+):
+    root = "viking://system/compile/example-skills"
+    uri = f"{root}/demo/assets/icon.bin"
+    content = b"\x89PNG\r\n\x1a\nasset"
+    vfs = _VFS(root)
+    coordinator = ContentWriteCoordinator(vfs)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+
+    result = await coordinator.batch_write(
+        root_uri=root,
+        operations=[
+            {
+                "uri": uri,
+                "content_base64": base64.b64encode(content).decode("ascii"),
+                "mode": "replace",
+            }
+        ],
+        ctx=ctx,
+    )
+
+    assert result["created"] == [uri]
+    assert vfs.files[uri] == content
+    assert result["semantic_status"] == "skipped"
+    assert result["vector_status"] == "skipped"
+    _coordinator_queue_for_unit_tests.enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_system_write_rejects_indexed_metadata():
     root = "viking://system/memory/memory_templates/custom/demo"
     uri = f"{root}/template.md"

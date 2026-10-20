@@ -9,10 +9,15 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from openviking.core.namespace_policy import (
+    SYSTEM_MEMORY_BUILTIN_ROOT,
+    SYSTEM_MEMORY_CUSTOM_ROOT,
+)
 from openviking.server.auth import get_request_context
 from openviking.server.identity import RequestContext, Role
 from openviking.server.routers import filesystem
 from openviking.service.fs_service import ListingPage
+from openviking.system_assets import builtin_memory_templates_dir
 from openviking_cli.exceptions import InvalidURIError
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -426,6 +431,24 @@ async def test_system_listing_default_http_output_uses_only_physical_metadata(
     entries = response.json()["result"]
     assert entries
     assert all("abstract" not in entry and "overview" not in entry for entry in entries)
+
+
+@pytest.mark.asyncio
+async def test_service_startup_syncs_builtin_assets_and_custom_directory(service):
+    ctx = RequestContext(user=UserIdentifier("default", "default"), role=Role.ROOT)
+    profile_uri = f"{SYSTEM_MEMORY_BUILTIN_ROOT}/profile.yaml"
+
+    assert await service.viking_fs.read_file_bytes(
+        profile_uri,
+        ctx=ctx,
+    ) == (builtin_memory_templates_dir() / "profile.yaml").read_bytes()
+    assert (
+        await service.viking_fs.stat(
+            SYSTEM_MEMORY_CUSTOM_ROOT,
+            ctx=ctx,
+            skip_count=True,
+        )
+    )["isDir"]
 
 
 @pytest.mark.asyncio

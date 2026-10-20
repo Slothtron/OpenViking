@@ -41,6 +41,7 @@ from openviking.storage.queuefs.reindex_processor import ReindexProcessor
 from openviking.storage.queuefs.session_commit_processor import SessionCommitProcessor
 from openviking.storage.viking_fs import VikingFS, init_viking_fs
 from openviking.storage.vikingdb_manager import VikingDBManager
+from openviking.system_assets.sync import SystemAssetSynchronizer
 from openviking.utils.agfs_utils import (
     build_runtime_ragfs_binding_config,
     resolve_queuefs_mount_point,
@@ -515,6 +516,9 @@ class OpenVikingService:
         directory_initializer = DirectoryInitializer(
             vikingdb=self._vikingdb_manager,
             viking_fs=self._viking_fs,
+            system_asset_synchronizer=SystemAssetSynchronizer(
+                viking_fs=self._viking_fs,
+            ),
         )
         self._directory_initializer = directory_initializer
         default_ctx = RequestContext(user=self._user, role=Role.ROOT)
