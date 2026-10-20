@@ -5,7 +5,7 @@
   "token_pattern": "(?:sk-(?:proj-|svcacct-|ant-(?:api\\d+-)?)?[A-Za-z0-9_./+=~\\-*]{16,}|(?:ak|ark)-[A-Za-z0-9_./+=~\\-*]{16,}|(?:gh[pousr]_|github_pat_)[A-Za-z0-9_./+=~\\-*]{16,}|(?:AKLT|AKTP)[A-Za-z0-9_./+=~\\-*]{12,}|(?:AKIA|ASIA)[A-Z0-9]{16})",
   "assignment_pattern": "(?P<key>api[ ]key|secret[ ]key|[A-Za-z_][A-Za-z0-9_-]{0,127})[\\\"']?\\]?[ \\t]*[:=：][ \\t]*",
   "cli_pattern": "(?:--(?P<key>[A-Za-z_][A-Za-z0-9_-]{0,127})(?:[ \\t]*=[ \\t]*|[ \\t]+)|-(?P<short>[uU])[ \\t]*)",
-  "auth_pattern": "(?i)(?:Bearer|Basic)[ \\t]+(?P<value>(?:\\[[^\\[\\]\\s\\\"',;]+\\]|[A-Za-z0-9_./+=~\\-*])+)",
+  "auth_pattern": "(?i)Bearer[ \\t]+(?P<value>(?:\\[[^\\[\\]\\s\\\"',;]+\\]|[A-Za-z0-9_./+=~\\-*])+)",
   "scheme_pattern": "(?i)(?:Bearer|Basic)[ \\t]+",
   "bracket_pattern": "\\[[^\\[\\]\\s\\\"',;]+\\]",
   "reference_pattern": "\\{\\{ov_privacy:[^{}\\r\\n]+\\}\\}"

@@ -56,6 +56,10 @@ def test_known_credentials_in_free_text(secret):
         "privateKey={value}",
         "Authorization: Bearer {value}",
         "Proxy-Authorization: Basic {value}",
+        "Authorization: basic {value}",
+        '"Authorization": "Basic {value}"',
+        "'Proxy-Authorization': 'Basic {value}'",
+        "**Authorization: Basic {value}**",
     ],
 )
 def test_named_fields_capture_only_value(syntax):
@@ -72,6 +76,7 @@ def test_named_fields_capture_only_value(syntax):
         (f"curl --oauth2-bearer {BODY} url", BODY),
         (f"curl -uuser:{BODY} url", f"user:{BODY}"),
         (f'curl -U "proxy:{BODY}" url', f"proxy:{BODY}"),
+        ("curl --authorization 'Basic demo-secret'", "demo-secret"),
         ("run --password 'two words' --limit 10", "two words"),
         ('run --password "true" --limit 10', "true"),
         (r"run --password two\ words --limit 10", r"two\ words"),
@@ -120,3 +125,16 @@ def test_noncredentials_and_references_are_preserved(content):
 )
 def test_mask_like_credentials_are_extracted(content, secret):
     assert matched_values(content) == [secret]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "This is a basic example of configuration.",
+        "Basic usage",
+        "Use basic Python syntax.",
+        "Basic dXNlcjpwYXNz",
+    ],
+)
+def test_basic_without_authentication_context_is_not_a_credential(content):
+    assert matched_values(content) == []

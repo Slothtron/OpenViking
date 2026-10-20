@@ -386,13 +386,14 @@ impl PrivacyExtractor {
                 }
                 let start = m.end();
                 let auth_start = start + usize::from(matches!(char_at(s, start), Some('\'' | '"')));
-                if matches!(
+                let start = if matches!(
                     normalize_key(&key.to_lowercase()).as_str(),
                     "authorization" | "proxyauthorization"
-                ) && self.scheme_end(s, auth_start, s.len()).is_some()
-                {
-                    continue;
-                }
+                ) {
+                    self.scheme_end(s, auth_start, s.len()).unwrap_or(start)
+                } else {
+                    start
+                };
                 let (start, end) = self.value_span(s, start);
                 self.add(&mut hits, source, start, end, key, false)?;
                 covered = end;
@@ -588,6 +589,26 @@ fn to_char_offsets(s: &str, hits: Vec<Hit>) -> Vec<(usize, usize, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn basic_requires_authentication_context() {
+        let extractor = PrivacyExtractor::new().unwrap();
+        let text = "Basic usage; Authorization: Basic demo-secret";
+        let chars: Vec<_> = text.chars().collect();
+        let values: Vec<String> = extractor
+            .extract(text, None)
+            .unwrap()
+            .iter()
+            .map(|(start, end, _)| chars[*start..*end].iter().collect())
+            .collect();
+        assert_eq!(values, ["demo-secret"]);
+        assert_eq!(
+            extractor
+                .extract("Basic demo-secret", Some("Authorization"))
+                .unwrap(),
+            vec![(6, 17, "authorization".to_owned())]
+        );
+    }
 
     #[test]
     fn unicode_offsets_and_overlaps_cover_complete_credentials() {

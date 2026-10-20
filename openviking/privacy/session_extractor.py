@@ -192,6 +192,7 @@ class _SessionExtraction(_PayloadTransformer):
         self.session_id = session_id
         self.value_matcher = value_matcher
         self.values: dict[str, Any] = {}
+        self.text_references: dict[str, str] = {}
         # Same input budget, with identity handlers: validate and copy, never extract.
         self.literal = _PayloadTransformer(self.budget)
 
@@ -235,7 +236,13 @@ class _SessionExtraction(_PayloadTransformer):
         replacements = []
         for start, end, reference in _merge_spans(spans):
             if reference is None:
-                reference = self.get_reference(text[start:end])
+                value = text[start:end]
+                reference = self.text_references.get(value)
+                if reference is None:
+                    reference = self.get_reference(value)
+                    self.text_references[value] = reference
+                else:
+                    self.budget.record_match()
             else:
                 self.budget.record_match()
             replacements.append(PrivacyReplacement(start, end, reference))
